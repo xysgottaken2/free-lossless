@@ -1,16 +1,20 @@
 import tkinter as tk
 from tkinter import ttk
 from selector import WindowSelector
+from ui_status import build_dlss5_status_lines, describe_runtime
+
 
 class GameSelectorUI:
-    def __init__(self):
+    def __init__(self, app_config=None):
         self.root = tk.Tk()
         self.root.title("Lossless Frame Gen - Select Game")
-        self.root.geometry("500x960")
+        self.root.geometry("520x1180")
         
         self.selected_window = None
         self.selector = WindowSelector()
-        
+        self.app_config = app_config
+        self._dlss5_status = None  # populated by _setup_dlss5_panel
+
         self._setup_ui()
         self._refresh_list()
 
@@ -110,6 +114,9 @@ class GameSelectorUI:
         self.sharp_scale = tk.Scale(sharp_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.sharp_var, length=200)
         self.sharp_scale.grid(row=0, column=1)
 
+        # ----- DLSS 5 Neural Rendering (optional stage before RIFE) -----
+        self._setup_dlss5_panel()
+
         # Buttons
         btn_frame = tk.Frame(self.root, pady=10)
         btn_frame.pack()
@@ -119,6 +126,96 @@ class GameSelectorUI:
         
         select_btn = tk.Button(btn_frame, text="Start Frame Gen", command=self._on_select, bg="#4CAF50", fg="white")
         select_btn.grid(row=0, column=1, padx=5)
+
+    def _setup_dlss5_panel(self):
+        """Optional DLSS 5 Neural Rendering stage controls + live status."""
+        cfg = None
+        if self.app_config is not None:
+            cfg = self.app_config.dlss5
+
+        dlss_frame = tk.LabelFrame(self.root, text="DLSS 5 Neural Rendering", pady=5, padx=10)
+        dlss_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.dlss5_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)) if cfg else False)
+        self.dlss5_check = tk.Checkbutton(
+            dlss_frame,
+            text="Enable DLSS 5 Neural Rendering",
+            variable=self.dlss5_var,
+        )
+        self.dlss5_check.grid(row=0, column=0, columnspan=2, sticky="w")
+
+        # Status block: Runtime / GPU / Backend / Status
+        self._dlss5_status = {}
+        status_box = tk.Frame(dlss_frame)
+        status_box.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        try:
+            from neural.runtime import RuntimeLocator
+            from neural.system_info import query_gpu_name, query_display_driver_version
+            report = RuntimeLocator().report()
+            runtime_text = describe_runtime(report.dlssnr.present, report.dlssnr.version)
+            gpu_text = query_gpu_name()
+            driver_text = query_display_driver_version()
+            backend_text = "ngx-core+dlssnr" if report.dlssnr.present and report.bridge else "none"
+            status_text = "Ready to probe" if report.dlssnr.present and report.bridge else "Disabled (runtime/bridge not found)"
+        except Exception as e:
+            runtime_text, gpu_text, driver_text = "Not Found", "unknown", "unknown"
+            backend_text, status_text = "none", f"Disabled ({e})"
+        lines = build_dlss5_status_lines(runtime_text, gpu_text, backend_text, status_text)
+        for i, line in enumerate(lines):
+            label = tk.Label(status_box, text=line, font=("Consolas", 9), fg="#333", anchor="w")
+            label.grid(row=i, column=0, sticky="w")
+            self._dlss5_status[i] = label
+        if driver_text and driver_text != "unknown":
+            tk.Label(status_box, text=f"Driver: {driver_text}", font=("Consolas", 9), fg="#666", anchor="w").grid(row=4, column=0, sticky="w")
+
+        # Controls confirmed against the real DLSSNR runtime contract
+        # (Intensity/Style/Passes/processing-scale; see docs/dlss5-research.md).
+        ctrl = tk.Frame(dlss_frame)
+        ctrl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Label(ctrl, text="Intensity:").grid(row=0, column=0, sticky="w")
+        self.dlss5_intensity_var = tk.DoubleVar(value=float(cfg.get("intensity", 0.35)) if cfg else 0.35)
+        self.dlss5_intensity_scale = tk.Scale(
+            ctrl, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
+            variable=self.dlss5_intensity_var, length=180,
+        )
+        self.dlss5_intensity_scale.grid(row=0, column=1, sticky="w")
+
+        tk.Label(ctrl, text="Style (0-6):").grid(row=1, column=0, sticky="w")
+        self.dlss5_style_var = tk.StringVar(value=str(int(cfg.get("style", 1)) if cfg else 1))
+        self.dlss5_style_combo = ttk.Combobox(
+            ctrl, textvariable=self.dlss5_style_var,
+            values=[str(i) for i in range(7)], state="readonly", width=6,
+        )
+        self.dlss5_style_combo.grid(row=1, column=1, sticky="w")
+
+        tk.Label(ctrl, text="Passes:").grid(row=2, column=0, sticky="w")
+        self.dlss5_passes_var = tk.StringVar(value=str(int(cfg.get("passes", 1)) if cfg else 1))
+        self.dlss5_passes_combo = ttk.Combobox(
+            ctrl, textvariable=self.dlss5_passes_var,
+            values=["1", "2"], state="readonly", width=6,
+        )
+        self.dlss5_passes_combo.grid(row=2, column=1, sticky="w")
+
+        tk.Label(ctrl, text="Processing scale:").grid(row=3, column=0, sticky="w")
+        self.dlss5_work_scale_var = tk.StringVar(value=str(float(cfg.get("work_scale", 1.0)) if cfg else 1.0))
+        self.dlss5_work_scale_combo = ttk.Combobox(
+            ctrl, textvariable=self.dlss5_work_scale_var,
+            values=["1.0", "0.75", "0.5"], state="readonly", width=6,
+        )
+        self.dlss5_work_scale_combo.grid(row=3, column=1, sticky="w")
+
+        self.dlss5_auto_mask_var = tk.BooleanVar(value=bool(cfg.get("auto_mask", 1)) if cfg else True)
+        self.dlss5_auto_mask_check = tk.Checkbutton(
+            ctrl, text="Automatic mask", variable=self.dlss5_auto_mask_var,
+        )
+        self.dlss5_auto_mask_check.grid(row=4, column=0, columnspan=2, sticky="w")
+
+        tk.Label(
+            dlss_frame,
+            text="Runtime vem em native/ (ver native/README.txt). Sem ele o app\nfunciona apenas com RIFE. RTX 20: experimental.",
+            font=("Arial", 8), fg="#777", justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def _refresh_list(self):
         # Clear
@@ -146,7 +243,14 @@ class GameSelectorUI:
                 "engine_type": self.engine_var.get(),
                 "ultra_smooth": self.ultra_smooth_var.get(),
                 "performance_mode": self.perf_mode_var.get(),
-                "low_latency": self.low_latency_var.get()
+                "low_latency": self.low_latency_var.get(),
+                # DLSS 5 Neural Rendering (optional stage)
+                "dlss5_enabled": self.dlss5_var.get(),
+                "dlss5_intensity": float(self.dlss5_intensity_var.get()),
+                "dlss5_style": int(self.dlss5_style_var.get()),
+                "dlss5_passes": int(self.dlss5_passes_var.get()),
+                "dlss5_work_scale": float(self.dlss5_work_scale_var.get()),
+                "dlss5_auto_mask": bool(self.dlss5_auto_mask_var.get()),
             }
             self.root.destroy()
 
