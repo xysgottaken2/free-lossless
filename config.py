@@ -61,6 +61,10 @@ DEFAULT_CONFIG = {
         "target_fps": 60,
         "low_latency": True,
         "performance_mode": False,
+        # Capture source: "window" (one app) or "fullscreen" (whole monitor).
+        "source": "window",
+        # Monitor index for Full Screen mode (0 = primary).
+        "monitor": 0,
     },
 }
 
@@ -77,6 +81,7 @@ _CLAMPS = {
     ("dlss5", "exposure"): (0.1, 4.0),
     ("dlss5", "temporal"): (0, 1),
     ("capture", "target_fps"): (10, 240),
+    ("capture", "monitor"): (0, 15),
 }
 
 
@@ -157,6 +162,11 @@ class AppConfig:
             if clamped is None:
                 clamped = copy.deepcopy(DEFAULT_CONFIG[section][key])
             self.data[section][key] = clamped
+        # Capture source string ("window" / "fullscreen", tolerant to aliases)
+        from targets import normalize_source
+        capture = self.data.get("capture", {})
+        capture["source"] = normalize_source(capture.get("source", "window"))
+        capture["mode"] = str(capture.get("mode", "dxcam"))
         # Booleans
         for (section, key) in (("dlss5", "enabled"), ("dlss5", "auto_mask"),
                                ("rife", "enabled"), ("rife", "ultra_smooth"),
