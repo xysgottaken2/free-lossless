@@ -165,6 +165,32 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Using the app
+
+The main window is divided into three parts:
+
+1. **Capture Source**
+   * **Capture Mode: Window** — capture one application window (select it in
+     *Detected Windows*; the capture follows the window if it moves).
+   * **Capture Mode: Full Screen** — capture a whole monitor regardless of
+     which app is in the foreground (pick the monitor in the *Monitor* list;
+     primary monitor works out of the box).
+2. **Settings** (scrollable) — Target FPS, Display Scale, Upscale Algorithm /
+   FSR, Frame Generation (RIFE) + engine, Ultra Smooth / Performance Mode /
+   Low Latency, Sharpening and the optional DLSS 5 panel.
+3. **Status + Start/Stop** (always visible at the bottom)
+   * **Start** — starts the whole pipeline (capture → optional DLSS 5 → RIFE →
+     transparent overlay). The button becomes **Stop** and the status shows
+     `Status: Running`.
+   * **Stop** — ends the pipeline and returns the window to `Status: Stopped`
+     (same as **F11**).
+
+Global hotkeys while running: **F9** toggles the FSR sharpening filter,
+**F10** shows/hides the FPS counter, **F11** stops.
+
+All settings persist in `config/freelossless.json`, including the capture
+mode and monitor.
+
 ## Building the executable
 
 ```powershell
@@ -205,7 +231,7 @@ The ZIP never contains the NVIDIA runtime: download the ZIP, extract it, add
    * **Intensity** (0–1; community guidance 0.20–0.35), **Style** (0–6),
      **Passes** (1–2), **Processing scale** (1.0/0.75/0.5), **Automatic mask**
 3. Frame generation (RIFE) is toggled independently with
-   `[ ] Generación de Frames` + the engine selector.
+   `[ ] Frame Generation (RIFE)` + the engine selector.
 
 All settings persist in `config/freelossless.json`.
 

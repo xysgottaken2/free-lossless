@@ -30,17 +30,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pytest opencv-python-headless
 
+      - name: Install Tk / Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libtcl8.6 libtk8.6
+
       - name: Syntax check (compileall)
         run: |
           python -m compileall -q config.py pipeline.py ui_status.py neural tests
           python -m compileall -q main.py ui.py selector.py engine.py capture.py filters.py build_app.py
+          python -m compileall -q targets.py app_controller.py
 
       - name: Import check (non-Windows modules)
         run: |
           python -c "import config, pipeline, ui_status, neural, neural.dlss5, neural.runtime, neural.bridge, neural.base"
+          python -c "import targets, app_controller"
 
-      - name: Unit tests
+      - name: Unit tests (Windows)
+        if: runner.os == 'Windows'
         run: python -m pytest tests/ -v
+
+      - name: Unit tests (Linux, with Tk UI smoke tests under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest tests/ -v
 
       - name: No proprietary NVIDIA binaries in the tree
         shell: bash
