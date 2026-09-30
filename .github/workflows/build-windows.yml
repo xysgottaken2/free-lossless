@@ -1,0 +1,49 @@
+name: Build Windows executable
+
+on:
+  push:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Check syntax and run tests
+        run: |
+          python -m compileall -q main.py ui.py selector.py capture.py engine.py filters.py build_app.py
+          python -m unittest discover -s tests -v
+
+      - name: Build executable
+        run: python build_app.py
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeLossless-Windows-x64
+          path: dist/FreeLossless.exe
+          if-no-files-found: error
+          retention-days: 30

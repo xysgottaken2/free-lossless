@@ -134,8 +134,8 @@ class RIFEEngine:
 
 
 class RIFEONNXEngine:
-    def __init__(self, model_path="models/rife_v4_lite.onnx"):
-        self.model_path = model_path
+    def __init__(self, model_path=None):
+        self.model_path = model_path or os.path.join(os.path.dirname(__file__), "models", "rife_v4_lite.onnx")
         self.session = None
         self.last_h = 0
         self.last_w = 0

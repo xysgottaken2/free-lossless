@@ -1,4 +1,3 @@
-import dxcam
 import time
 import cv2
 import numpy as np
@@ -6,19 +5,23 @@ import win32gui
 import win32ui
 import win32con
 import win32api
-import time
 
 class ScreenCapture:
-    def __init__(self, region=None, device_idx=0, output_color="RGB", mode="dxcam"):
+    def __init__(self, region=None, device_idx=0, output_color="RGB", mode="dxcam",
+                 output_idx=None, desktop_coordinates=False):
         """
         Initialize the capture.
         :param region: Tuple of (left, top, right, bottom). If None, captures full screen.
         :param mode: "dxcam" or "bitblt"
+        :param desktop_coordinates: Resolve a desktop region to its DXGI output.
         """
         self.mode = mode
         self.camera = None
-        if self.mode == "dxcam":
-            self.camera = dxcam.create(device_idx=device_idx, output_color=output_color)
+        self.device_idx = device_idx
+        self.output_idx = output_idx
+        self.output_color = output_color
+        self.desktop_coordinates = desktop_coordinates
+        self._camera_key = None
         
         self.region = region
         self.is_capturing = False
@@ -29,6 +32,15 @@ class ScreenCapture:
         self._save_dc = None
         self._save_bitmap = None
         self._last_dims = (0, 0)
+
+        if self.mode == "dxcam":
+            # Initialize comtypes/DXCAM on the caller's main thread, not the
+            # short-lived capture worker. BitBlt still has no DXGI dependency.
+            try:
+                import dxcam
+            except Exception as exc:
+                print(f"DXCAM unavailable: {exc}. Falling back to BitBlt.")
+                self.mode = "bitblt"
         
     def capture_frame(self):
         """
@@ -39,22 +51,63 @@ class ScreenCapture:
         else:
             return self._capture_bitblt()
 
+    @staticmethod
+    def _resolve_dxcam_output(dxcam, device, monitor_rect):
+        # dxcam 0.0.5 exposes no public DeviceName -> output index mapping.
+        # Keep this version-specific adapter isolated; never guess by list order.
+        factory = getattr(dxcam, "__factory", None)
+        for device_idx, outputs in enumerate(getattr(factory, "outputs", [])):
+            for output_idx, output in enumerate(outputs):
+                if output.devicename.rstrip("\0").casefold() != device.casefold():
+                    continue
+                coords = output.desc.DesktopCoordinates
+                rect = (coords.left, coords.top, coords.right, coords.bottom)
+                if rect == monitor_rect:
+                    return device_idx, output_idx
+        raise RuntimeError("Monitor not available in DXCAM; using BitBlt.")
+
+    def _prepare_dxcam(self):
+        import dxcam  # Already initialized on the main thread for DXCAM mode.
+
+        key = (self.device_idx, self.output_idx)
+        region = self.region
+        if self.desktop_coordinates and region is not None:
+            monitor = win32api.MonitorFromRect(region, 2)  # MONITOR_DEFAULTTONEAREST
+            info = win32api.GetMonitorInfo(monitor)
+            ml, mt, mr, mb = info["Monitor"]
+            left, top, right, bottom = region
+            if not (ml <= left < right <= mr and mt <= top < bottom <= mb):
+                # GDI can capture windows spanning outputs, unlike a single DXCamera.
+                return None
+            key = self._resolve_dxcam_output(dxcam, info["Device"], tuple(info["Monitor"]))
+            region = (left - ml, top - mt, right - ml, bottom - mt)
+
+        if self.camera is None or self._camera_key != key:
+            self._release_camera()
+            self.camera = dxcam.create(
+                device_idx=key[0], output_idx=key[1], output_color=self.output_color,
+            )
+            self._camera_key = key
+        return region
+
     def _capture_dxcam(self):
-        frame = None
-        if self.region:
-            frame = self.camera.grab(region=self.region)
-        else:
-            frame = self.camera.grab()
-        
-        if frame is None:
-            frame = self.camera.get_latest_frame()
-            
-        return frame
+        try:
+            region = self._prepare_dxcam()
+            if self.desktop_coordinates and self.region is not None and region is None:
+                return self._capture_bitblt()
+            # grab() returns None on an unchanged desktop. Do not call the blocking
+            # get_latest_frame() unless the asynchronous capture loop was started.
+            return self.camera.grab(region=region)
+        except Exception as exc:
+            print(f"DXCAM unavailable: {exc}. Falling back to BitBlt.")
+            self._release_camera()
+            self.mode = "bitblt"
+            return self._capture_bitblt()
 
     def _init_bitblt_resources(self, width, height):
         self._cleanup_gdi()
-        hwnd = win32gui.GetDesktopWindow()
-        self._hwnd_dc = win32gui.GetWindowDC(hwnd)
+        # Screen DC uses virtual-desktop coordinates, including negative origins.
+        self._hwnd_dc = win32gui.GetDC(0)
         self._mfc_dc = win32ui.CreateDCFromHandle(self._hwnd_dc)
         self._save_dc = self._mfc_dc.CreateCompatibleDC()
         self._save_bitmap = win32ui.CreateBitmap()
@@ -82,8 +135,7 @@ class ScreenCapture:
             
         if self._hwnd_dc:
             try:
-                hwnd = win32gui.GetDesktopWindow()
-                win32gui.ReleaseDC(hwnd, self._hwnd_dc)
+                win32gui.ReleaseDC(0, self._hwnd_dc)
             except:
                 pass
             self._hwnd_dc = None
@@ -144,18 +196,30 @@ class ScreenCapture:
         """
         Starts a continuous capture loop.
         """
-        self.camera.start(target_fps=target_fps, region=self.region)
+        if self.mode != "dxcam":
+            raise RuntimeError("High-speed capture requires DXCAM.")
+        region = self._prepare_dxcam()
+        if self.desktop_coordinates and self.region is not None and region is None:
+            raise ValueError("DXCAM high-speed capture requires a region inside one monitor.")
+        self.camera.start(target_fps=target_fps, region=region)
         self.is_capturing = True
         print(f"Started DXCAM capture at {target_fps} FPS")
 
     def get_latest_frame(self):
         return self.camera.get_latest_frame()
 
+    def _release_camera(self):
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+        self._camera_key = None
+        self.is_capturing = False
+
     def stop_capture(self):
-        if self.is_capturing and self.camera is not None:
-            self.camera.stop()
-            self.is_capturing = False
-        self._cleanup_gdi()
+        try:
+            self._release_camera()
+        finally:
+            self._cleanup_gdi()
 
 if __name__ == "__main__":
     # Test capture
