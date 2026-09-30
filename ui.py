@@ -45,16 +45,16 @@ class GameSelectorUI:
         self.list_label.pack(anchor="w", padx=10, pady=(10, 0))
 
         # Listbox
-        self.tree = ttk.Treeview(self.root, columns=("Title", "Process"), show="headings", selectmode="browse", height=6)
+        list_frame = tk.Frame(self.root)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.tree = ttk.Treeview(list_frame, columns=("Title", "Process"), show="headings", selectmode="browse", height=6)
         self.tree.heading("Title", text="Título de Ventana")
         self.tree.heading("Process", text="Proceso")
         self.tree.column("Title", width=300)
         self.tree.column("Process", width=150)
-        list_frame = tk.Frame(self.root)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(in_=list_frame, side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         mode_frame = tk.Frame(self.root, pady=5)
