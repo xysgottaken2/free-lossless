@@ -21,6 +21,7 @@ if errorlevel 1 (
 )
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+if not exist "%OUT_DIR%build_bridge_objs" mkdir "%OUT_DIR%build_bridge_objs"
 
 cl /nologo /std:c++17 /O2 /W3 /EHsc /DWIN32 /D_WINDOWS /DNDEBUG ^
    /I"%SRC_DIR%" ^
