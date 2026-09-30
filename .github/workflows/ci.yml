@@ -1,0 +1,57 @@
+name: CI
+
+# Light checks on every push/PR: syntax, imports and the unit test suite.
+# No GPU, no NVIDIA runtime, no proprietary DLLs - everything must pass on a
+# plain machine (and does NOT prove DLSS 5 works on real hardware).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest opencv-python-headless
+
+      - name: Syntax check (compileall)
+        run: |
+          python -m compileall -q config.py pipeline.py ui_status.py neural tests
+          python -m compileall -q main.py ui.py selector.py engine.py capture.py filters.py build_app.py
+
+      - name: Import check (non-Windows modules)
+        run: |
+          python -c "import config, pipeline, ui_status, neural, neural.dlss5, neural.runtime, neural.bridge, neural.base"
+
+      - name: Unit tests
+        run: python -m pytest tests/ -v
+
+      - name: No proprietary NVIDIA binaries in the tree
+        shell: bash
+        run: |
+          set -e
+          # The repository must never contain NVIDIA runtime binaries.
+          found=$(find . -type f \( -iname 'nvngx*.dll' -o -iname '_nvngx.dll' \) \
+                  ! -name 'freelossless-nvngx.dll' -not -path './.git/*' -not -path './.venv/*' || true)
+          if [ -n "$found" ]; then
+            echo "ERROR: proprietary NVIDIA runtime files found in the repository:"
+            echo "$found"
+            exit 1
+          fi
+          echo "OK: no NVIDIA runtime binaries committed."

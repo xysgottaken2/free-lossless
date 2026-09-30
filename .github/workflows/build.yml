@@ -1,0 +1,109 @@
+name: Build
+
+# Heavy standalone build - triggered MANUALLY (workflow_dispatch) to avoid
+# burning runner time on every commit. Produces the distributable ZIP:
+#
+#   FreeLossless-DLSS5.zip
+#   ├── FreeLossless.exe
+#   ├── native/
+#   │   ├── README.txt
+#   │   └── freelossless-nvngx.dll   (our DLSS 5 bridge, MIT-style, built here)
+#   ├── models/
+#   ├── config/
+#   ├── README.md
+#   └── THIRD-PARTY.md
+#
+# The ZIP NEVER contains the proprietary NVIDIA runtime. The user adds
+# native/nvngx_dlssnr.dll manually (see native/README.txt).
+
+on:
+  workflow_dispatch:
+  # Uncomment to also build on version tags:
+  # push:
+  #   tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 (64-bit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Build DLSS 5 bridge (freelossless-nvngx.dll)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+          call native\src\build_bridge.bat native\
+          if not exist native\freelossless-nvngx.dll exit /b 1
+
+      - name: Run build_app.py (PyInstaller standalone)
+        run: python build_app.py
+
+      - name: Verify executable was created
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\FreeLossless.exe")) {
+            Write-Error "dist\FreeLossless.exe was not produced"
+            exit 1
+          }
+          (Get-Item "dist\FreeLossless.exe").Length
+
+      - name: Assemble distribution folder
+        shell: pwsh
+        run: |
+          $stage = "FreeLossless-DLSS5"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "dist\FreeLossless.exe" "$stage\FreeLossless.exe"
+          New-Item -ItemType Directory -Force -Path "$stage\native" | Out-Null
+          Copy-Item "native\README.txt" "$stage\native\README.txt"
+          Copy-Item "native\freelossless-nvngx.dll" "$stage\native\freelossless-nvngx.dll"
+          New-Item -ItemType Directory -Force -Path "$stage\models" | Out-Null
+          Copy-Item "models\*" "$stage\models\"
+          New-Item -ItemType Directory -Force -Path "$stage\config" | Out-Null
+          Set-Content "$stage\config\README.txt" "freelossless.json is created here on first run."
+          Copy-Item "README.md" "$stage\README.md"
+          Copy-Item "THIRD-PARTY.md" "$stage\THIRD-PARTY.md"
+          Get-ChildItem -Recurse $stage | Select-Object FullName, Length
+
+      - name: Guard - no proprietary NVIDIA runtime in the package
+        shell: pwsh
+        run: |
+          $banned = @("nvngx_dlssnr.dll","nvngx.dll","_nvngx.dll","nvngx_dlss.dll","nvngx_dlssg.dll","nvngx_dlssd.dll")
+          $found = Get-ChildItem -Recurse "FreeLossless-DLSS5" -File | Where-Object { $banned -contains $_.Name }
+          if ($found) {
+            Write-Error "Refusing to package proprietary NVIDIA runtime files:"
+            $found | ForEach-Object { Write-Error $_.FullName }
+            exit 1
+          }
+          Write-Host "OK: package contains no NVIDIA runtime binaries."
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "FreeLossless-DLSS5\*" -DestinationPath "FreeLossless-DLSS5.zip" -Force
+          (Get-Item "FreeLossless-DLSS5.zip").Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeLossless-DLSS5
+          path: FreeLossless-DLSS5.zip
+          if-no-files-found: error
+          retention-days: 30

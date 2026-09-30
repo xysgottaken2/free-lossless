@@ -24,6 +24,17 @@ hidden_imports = [
     "win32api",
     "psutil",
     "requests",
+    # Free Lossless modules (neural pipeline / config)
+    "config",
+    "pipeline",
+    "ui_status",
+    "neural",
+    "neural.base",
+    "neural.log",
+    "neural.runtime",
+    "neural.bridge",
+    "neural.dlss5",
+    "neural.system_info",
 ]
 
 def build():
