@@ -128,7 +128,17 @@ uint32_t align256(uint32_t bytes) { return (bytes + 255u) & ~255u; }
 void wcopy(wchar_t* dst, size_t cap, const wchar_t* src) {
     if (!dst || cap == 0) return;
     if (!src) { dst[0] = 0; return; }
-    wcsncpy_s(dst, cap, src, _TRUNCATE);
+    size_t i = 0;
+    for (; i + 1 < cap && src[i]; ++i) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+void acopy(char* dst, size_t cap, const char* src) {
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = 0; return; }
+    size_t i = 0;
+    for (; i + 1 < cap && src[i]; ++i) dst[i] = src[i];
+    dst[i] = 0;
 }
 
 std::wstring join_path(const wchar_t* dir, const wchar_t* name) {
@@ -153,9 +163,9 @@ std::wstring runtime_version_string(const std::wstring& path) {
     UINT len = 0;
     if (!VerQueryValueW(data.data(), L"\\", (void**)&info, &len) || !info) return L"unknown";
     wchar_t buf[64];
-    swprintf_s(buf, L"%u.%u.%u.%u",
-               HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
-               HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    swprintf(buf, 64, L"%u.%u.%u.%u",
+             HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+             HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
     return buf;
 }
 
@@ -414,7 +424,7 @@ void Server::sync_status() {
     wcopy(status.gpu, 128, gpu.adapter_name.c_str());
     wcopy(status.core_path, 260, core_path.c_str());
     wcopy(status.runtime_path, 260, runtime_path.c_str());
-    strncpy_s(status.backend, sizeof(status.backend), "ngx-core+dlssnr", _TRUNCATE);
+    acopy(status.backend, sizeof(status.backend), "ngx-core+dlssnr");
 }
 
 int32_t Server::init(const FlNrOptions* opt, const wchar_t* native_dir,

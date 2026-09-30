@@ -58,6 +58,14 @@ jobs:
           call native\src\build_bridge.bat native\
           if not exist native\freelossless-nvngx.dll exit /b 1
 
+      - name: Upload bridge build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-build-log
+          path: native/build_bridge.log
+          if-no-files-found: ignore
+
       - name: Run build_app.py (PyInstaller standalone)
         run: python build_app.py
 
