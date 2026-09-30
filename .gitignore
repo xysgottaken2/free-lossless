@@ -158,3 +158,12 @@ cython_debug/
 *.png
 rife-bin/
 rife.zip
+
+# Free Lossless - DLSS 5 external runtime & build outputs
+# (never commit NVIDIA runtime binaries or locally built bridge DLLs)
+native/*.dll
+native/logs/
+native/build_bridge_objs/
+config/freelossless.json
+FreeLossless-DLSS5/
+FreeLossless-DLSS5.zip

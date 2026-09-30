@@ -1,0 +1,6 @@
+LIBRARY freelossless-nvngx
+EXPORTS
+    flnr_init
+    flnr_process
+    flnr_get_status
+    flnr_shutdown

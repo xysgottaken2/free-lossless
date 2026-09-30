@@ -9,16 +9,25 @@ import win32api
 import time
 
 class ScreenCapture:
-    def __init__(self, region=None, device_idx=0, output_color="RGB", mode="dxcam"):
+    def __init__(self, region=None, device_idx=0, output_color="RGB", mode="dxcam", output_idx=None):
         """
         Initialize the capture.
-        :param region: Tuple of (left, top, right, bottom). If None, captures full screen.
+        :param region: Tuple of (left, top, right, bottom). If None, captures the full output.
         :param mode: "dxcam" or "bitblt"
+        :param output_idx: monitor index for dxcam (0 = primary). Used when
+               capturing a whole monitor (Full Screen mode).
         """
         self.mode = mode
         self.camera = None
+        self.output_idx = output_idx
         if self.mode == "dxcam":
-            self.camera = dxcam.create(device_idx=device_idx, output_color=output_color)
+            try:
+                self.camera = dxcam.create(device_idx=device_idx,
+                                           output_idx=output_idx,
+                                           output_color=output_color)
+            except TypeError:
+                # Older dxcam builds have no output_idx parameter.
+                self.camera = dxcam.create(device_idx=device_idx, output_color=output_color)
         
         self.region = region
         self.is_capturing = False
@@ -30,6 +39,18 @@ class ScreenCapture:
         self._save_bitmap = None
         self._last_dims = (0, 0)
         
+    @classmethod
+    def for_target(cls, target, mode="dxcam", output_color="RGB"):
+        """Build a capture for a ``targets.CaptureTarget`` (duck-typed).
+
+        Full Screen targets grab a whole dxcam output (monitor via output_idx)
+        or the monitor rectangle via bitblt; Window targets grab the window
+        rectangle, exactly like before.
+        """
+        region = None if getattr(target, "full_output", False) else target.rect
+        return cls(region=region, device_idx=0, output_color=output_color,
+                   mode=mode, output_idx=getattr(target, "output_idx", 0))
+
     def capture_frame(self):
         """
         Captures a single frame based on the current mode.
@@ -114,8 +135,16 @@ class ScreenCapture:
             if (width, height) != self._last_dims or self._save_dc is None:
                 self._init_bitblt_resources(width, height)
 
-            # 1. BitBlt to our compatible DC
-            self._save_dc.BitBlt((0, 0), (width, height), self._mfc_dc, (left, top), win32con.SRCCOPY)
+            # 1. BitBlt to our compatible DC. The desktop DC spans the whole
+            # virtual screen, so screen coordinates must be offset by its origin
+            # (multi-monitor aware).
+            try:
+                vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+                vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+            except Exception:
+                vx, vy = 0, 0
+            self._save_dc.BitBlt((0, 0), (width, height), self._mfc_dc,
+                                 (left - vx, top - vy), win32con.SRCCOPY)
             
             # 2. Extract bits directly to a pre-allocated numpy array for speed
             # GetBitmapBits is very slow. GetDIBits is preferred but win32ui's GetBitmapBits 
