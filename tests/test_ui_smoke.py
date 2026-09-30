@@ -4,9 +4,16 @@ These need a real Tk display: they run on Windows and under ``xvfb-run`` on
 Linux CI; on machines without tkinter/display they are skipped.
 """
 
+import os
+
 import pytest
 
-tk = pytest.importorskip("tkinter")
+# FREE_LOSSLESS_REQUIRE_TK=1 (set in CI) turns "no Tk" from a skip into a
+# failure so the UI smoke tests can never be silently skipped there.
+if os.environ.get("FREE_LOSSLESS_REQUIRE_TK") == "1":
+    import tkinter as tk
+else:
+    tk = pytest.importorskip("tkinter")
 
 from app_controller import (  # noqa: E402
     BUTTON_START,
@@ -29,6 +36,8 @@ def ui(tmp_path):
     try:
         widget = ui_module.GameSelectorUI(app_config=cfg)
     except tk.TclError as exc:  # no display
+        if os.environ.get("FREE_LOSSLESS_REQUIRE_TK") == "1":
+            raise
         pytest.skip(f"no Tk display: {exc}")
     yield widget
     try:
