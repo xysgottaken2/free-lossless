@@ -19,11 +19,16 @@ import os
 def processing_subroutine(capture_queue, process_queue, engine_config, stop_event):
     """
     Standalone subroutine for multiprocessing.
+
+    Stage chain: Resize -> [DLSS 5 Neural Rendering (optional)] -> [RIFE (optional)].
+    A DLSS 5 failure never kills this worker: the stage disables itself and the
+    frames keep flowing to the overlay (RIFE-only pipeline).
     """
     from engine import RIFEEngine, RIFEONNXEngine
-    import cv2
+    from neural import create_renderer, log_rife
+    from pipeline import FramePipeline
     import numpy as np
-    
+
     # Initialize engine inside the process
     if engine_config.get("engine_type") == "AI (RIFE ONNX)":
         engine = RIFEONNXEngine()
@@ -37,28 +42,37 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
     internal_res = engine_config.get("internal_res", (800, 600))
     last_frame = None
 
+    # Optional DLSS 5 Neural Rendering stage (external NVIDIA runtime in native/).
+    dlss5_options = engine_config.get("dlss5") or {}
+    renderer = create_renderer(
+        dlss5_options,
+        expected_size=(internal_res[0], internal_res[1]),
+    )
+
+    pipeline = FramePipeline(
+        engine=engine,
+        renderer=renderer,
+        internal_res=internal_res,
+        fg_enabled=fg_enabled,
+    )
+
     print(f"Sub-process processing worker started (PID: {os.getpid()})")
     
     while not stop_event.is_set():
         try:
             # We use a small timeout to check the stop_event periodically
             current_frame = capture_queue.get(timeout=0.1)
-            
-            # Internal Scaling
-            h, w = current_frame.shape[:2]
-            if w > internal_res[0] or h > internal_res[1]:
-                current_frame = cv2.resize(current_frame, internal_res, interpolation=cv2.INTER_LINEAR)
 
-            if fg_enabled and last_frame is not None:
-                inter_frame = engine.interpolate(last_frame, current_frame)
-                process_queue.put(inter_frame)
-                process_queue.put(current_frame)
-            else:
-                process_queue.put(current_frame)
-            
-            last_frame = current_frame
+            frames = pipeline.process_frame(current_frame)
+            for f in frames:
+                process_queue.put(f)
         except:
             continue
+
+    try:
+        renderer.shutdown()
+    except Exception:
+        pass
 
 class FrameGenerationApp:
     def __init__(self, target_fps=60):
@@ -67,6 +81,14 @@ class FrameGenerationApp:
         self.engine = RIFEEngine()
         self.running = False
         self.target_window = None
+        # Persistent configuration (config/freelossless.json)
+        try:
+            from config import AppConfig
+            self.app_config = AppConfig.load()
+        except Exception as e:
+            print(f"[CONFIG] Using in-memory defaults: {e}")
+            from config import AppConfig
+            self.app_config = AppConfig()
         
         # Queues for pipeline (Use multiprocessing queues for inter-process communication)
         self.capture_queue = multiprocessing.Queue(maxsize=2)
@@ -174,7 +196,7 @@ class FrameGenerationApp:
                 time.sleep(0.0005)
 
     def select_game(self):
-        ui = GameSelectorUI()
+        ui = GameSelectorUI(self.app_config)
         self.target_window = ui.get_selection()
         if not self.target_window:
             return False
@@ -210,6 +232,22 @@ class FrameGenerationApp:
             self.engine = RIFEEngine()
             
         self.engine.set_high_precision(self.ultra_smooth) if hasattr(self.engine, 'set_high_precision') else None
+
+        # --- DLSS 5 Neural Rendering options (persisted) ---
+        dlss5_opts = self.app_config.dlss5
+        dlss5_opts["enabled"] = bool(self.target_window.get("dlss5_enabled", dlss5_opts.get("enabled", False)))
+        dlss5_opts["passes"] = int(self.target_window.get("dlss5_passes", dlss5_opts.get("passes", 1)))
+        dlss5_opts["style"] = int(self.target_window.get("dlss5_style", dlss5_opts.get("style", 1)))
+        dlss5_opts["intensity"] = float(self.target_window.get("dlss5_intensity", dlss5_opts.get("intensity", 0.35)))
+        dlss5_opts["work_scale"] = float(self.target_window.get("dlss5_work_scale", dlss5_opts.get("work_scale", 1.0)))
+        dlss5_opts["auto_mask"] = 1 if self.target_window.get("dlss5_auto_mask", bool(dlss5_opts.get("auto_mask", 1))) else 0
+        self.app_config.rife["enabled"] = bool(self.fg_enabled)
+        self.app_config.rife["engine_type"] = self.target_window.get("engine_type", "AI (RIFE ONNX)")
+        self.app_config.rife["ultra_smooth"] = bool(self.ultra_smooth)
+        try:
+            self.app_config.save()
+        except Exception as e:
+            print(f"[CONFIG] Could not save configuration: {e}")
         
         # Adaptive Buffer based on latency selection
         self.low_latency = self.target_window.get("low_latency", True)
@@ -305,7 +343,8 @@ class FrameGenerationApp:
             "engine_type": self.target_window.get("engine_type"),
             "ultra_smooth": self.ultra_smooth,
             "fg_enabled": self.fg_enabled,
-            "internal_res": self.internal_res
+            "internal_res": self.internal_res,
+            "dlss5": self.app_config.dlss5_options(),
         }
         
         self.stop_event = multiprocessing.Event()
