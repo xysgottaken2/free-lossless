@@ -18,6 +18,10 @@ name: Build
 
 on:
   workflow_dispatch:
+  # TEMPORARY (verification only): run once for this arena session branch.
+  # Reverted before merge - the merged workflow is workflow_dispatch-only.
+  push:
+    branches: ["arena/**"]
   # Uncomment to also build on version tags:
   # push:
   #   tags: ["v*"]
