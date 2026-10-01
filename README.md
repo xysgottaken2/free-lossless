@@ -116,11 +116,15 @@ demorar mais que o normal).
 O gargalo do overlay era o pós-processamento na resolução cheia do monitor, a cada
 frame, além de cópias desnecessárias na captura:
 
-| Etapa (1080p) | Antes | Agora |
+Medições na resolução interna (800 × 600; no modo de desempenho, 1280 × 720),
+numa máquina de teste modesta com 2 núcleos — em um PC comum os números são bem
+menores:
+
+| Etapa | Antes (1080p) | Agora (resolução interna) |
 | --- | --- | --- |
-| CAS / nitidez adaptativa | ~95 ms | ~2-6 ms (na resolução interna) |
-| Caminho FSR completo | ~127 ms | ~8-14 ms (nitidez + bicúbico) |
-| Nitidez simples | ~11 ms | ~3-5 ms (na resolução interna) |
+| CAS / nitidez adaptativa | ~95 ms | ~2,6 ms (800 × 600) · ~12 ms (1280 × 720) |
+| Caminho FSR completo | ~127 ms | ~5 ms (800 × 600) · ~15 ms (1280 × 720) |
+| Nitidez simples | ~11 ms | ~3 a 5 ms |
 | Conversão BGRA→RGB (BitBlt) | ~11 ms | ~0,3 ms (`cv2.cvtColor`) |
 | Upscale Lanczos | ~22 ms | bicúbico, ~2 ms |
 
