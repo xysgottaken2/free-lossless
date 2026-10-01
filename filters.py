@@ -67,8 +67,8 @@ class AMDFilters:
         return AMDFilters.apply_cas(upscaled, sharpness=0.3)
 
 class NvidiaAIUpscaler:
-    def __init__(self, model_path="models/fsrcnn_x2.onnx"):
-        self.model_path = model_path
+    def __init__(self, model_path=None):
+        self.model_path = model_path or os.path.join(os.path.dirname(__file__), "models", "fsrcnn_x2.onnx")
         self.session = None
         self._download_model_if_missing()
         self._init_session()

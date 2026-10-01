@@ -1,14 +1,14 @@
 import tkinter as tk
-from tkinter import ttk
-from selector import WindowSelector
+from tkinter import ttk, messagebox
+from selector import WindowSelector, DisplaySelector
 
 class GameSelectorUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Lossless Frame Gen - Select Game")
+        self.root.title("Lossless Frame Gen - Selecionar fonte")
         self.root.geometry("500x960")
         
-        self.selected_window = None
+        self.selected_source = None
         self.selector = WindowSelector()
         
         self._setup_ui()
@@ -22,7 +22,7 @@ class GameSelectorUI:
         
         instr_text = (
             "Instrucciones:\n"
-            "1. Selecciona la ventana del juego abajo.\n"
+            "1. Selecione uma janela ou um monitor abaixo.\n"
             "2. Ajusta el Target FPS (60-120 recomendado).\n"
             "3. Presiona 'Start' para iniciar el overlay.\n\n"
             "Comandos Globales:\n"
@@ -32,19 +32,34 @@ class GameSelectorUI:
         )
         tk.Label(header, text=instr_text, justify=tk.LEFT, font=("Arial", 9), fg="#555", padx=20).pack(anchor="w")
 
-        tk.Label(self.root, text="Ventanas Detectadas:", font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(10,0))
+        source_frame = tk.Frame(self.root, pady=5)
+        source_frame.pack(fill=tk.X, padx=10)
+        tk.Label(source_frame, text="Fonte de captura:").pack(side=tk.LEFT)
+        self.source_var = tk.StringVar(value="window")
+        for value, label in (("window", "Janela (app/jogo)"), ("display", "Display/Monitor")):
+            tk.Radiobutton(
+                source_frame, text=label, value=value, variable=self.source_var,
+                indicatoron=False, command=self._refresh_list, padx=8,
+            ).pack(side=tk.LEFT, padx=3)
+        self.list_label = tk.Label(self.root, font=("Arial", 10, "bold"))
+        self.list_label.pack(anchor="w", padx=10, pady=(10, 0))
 
         # Listbox
-        self.tree = ttk.Treeview(self.root, columns=("Title", "Process"), show="headings")
+        list_frame = tk.Frame(self.root)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.tree = ttk.Treeview(list_frame, columns=("Title", "Process"), show="headings", selectmode="browse", height=6)
         self.tree.heading("Title", text="Título de Ventana")
         self.tree.heading("Process", text="Proceso")
         self.tree.column("Title", width=300)
         self.tree.column("Process", width=150)
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         mode_frame = tk.Frame(self.root, pady=5)
         mode_frame.pack()
-        tk.Label(mode_frame, text="Capture Mode: ").grid(row=0, column=0)
+        tk.Label(mode_frame, text="Backend de captura: ").grid(row=0, column=0)
         self.mode_var = tk.StringVar(value="bitblt")
         self.mode_combo = ttk.Combobox(mode_frame, textvariable=self.mode_var, values=["dxcam", "bitblt"], state="readonly", width=10)
         self.mode_combo.grid(row=0, column=1)
@@ -121,22 +136,35 @@ class GameSelectorUI:
         select_btn.grid(row=0, column=1, padx=5)
 
     def _refresh_list(self):
-        # Clear
         for item in self.tree.get_children():
             self.tree.delete(item)
-            
-        windows = self.selector.get_visible_windows()
-        for w in windows:
-            self.tree.insert("", tk.END, values=(w["title"], w["process"]), iid=str(w["hwnd"]))
+        self.sources = {}
+        is_display = self.source_var.get() == "display"
+        self.list_label.config(text="Monitores detectados:" if is_display else "Janelas detectadas:")
+        self.tree.heading("Title", text="Monitor" if is_display else "Título da janela")
+        self.tree.heading("Process", text="Resolução / posição" if is_display else "Processo")
+        sources = DisplaySelector.get_displays() if is_display else self.selector.get_visible_windows()
+        for index, source in enumerate(sources):
+            source = dict(source)
+            source.setdefault("source_type", "window")
+            if is_display:
+                left, top, right, bottom = source["rect"]
+                detail = f"{right - left} x {bottom - top} ({left}, {top})"
+            else:
+                detail = source["process"]
+            iid = str(index)
+            self.sources[iid] = source
+            self.tree.insert("", tk.END, values=(source["title"], detail), iid=iid)
 
     def _on_select(self):
         selected = self.tree.selection()
-        if selected:
-            hwnd = int(selected[0])
-            title = self.tree.item(selected[0], "values")[0]
-            self.selected_window = {
-                "hwnd": hwnd, 
-                "title": title,
+        if not selected:
+            messagebox.showinfo("Selecione uma fonte", "Selecione uma janela ou um monitor na lista.")
+            return
+        source = self.sources.get(selected[0])
+        if source:
+            self.selected_source = {
+                **source,
                 "mode": self.mode_var.get(),
                 "fps": self.fps_var.get(),
                 "scale": self.scale_var.get(),
@@ -157,7 +185,7 @@ class GameSelectorUI:
 
     def get_selection(self):
         self.root.mainloop()
-        return self.selected_window
+        return self.selected_source
 
 if __name__ == "__main__":
     ui = GameSelectorUI()

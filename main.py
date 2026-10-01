@@ -5,11 +5,12 @@ import threading
 import time
 import ctypes
 import multiprocessing
-from queue import Queue
+from queue import Queue, Full
 from capture import ScreenCapture
 from engine import RIFEEngine, RIFEONNXEngine
 from ui import GameSelectorUI
-from selector import WindowSelector
+from selector import get_source_rect, get_source_monitor_rect
+from tkinter import messagebox
 from filters import AMDFilters, NvidiaAIUpscaler
 import win32gui
 import win32con
@@ -63,10 +64,10 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
 class FrameGenerationApp:
     def __init__(self, target_fps=60):
         self.target_fps = target_fps
-        self.capture = ScreenCapture()
+        self.capture = None
         self.engine = RIFEEngine()
         self.running = False
-        self.target_window = None
+        self.target_source = None
         
         # Queues for pipeline (Use multiprocessing queues for inter-process communication)
         self.capture_queue = multiprocessing.Queue(maxsize=2)
@@ -96,45 +97,55 @@ class FrameGenerationApp:
         last_frame = None
         # Target capture is exactly half the display FPS
         capture_interval = 1.0 / (self.target_fps / 2) if self.target_fps > 0 else 1.0/30.0
-        
+
         last_capture_time = time.perf_counter()
-        
-        while self.running:
-            # Update region based on window position
-            if self.target_window:
-                try:
-                    rect = WindowSelector.get_window_rect(self.target_window["hwnd"])
-                    self.capture.region = rect # Update region
-                except:
-                    print("Lost window, stopping...")
-                    self.running = False
-                    break
-            
-            now = time.perf_counter()
-            if now - last_capture_time < capture_interval:
-                time.sleep(0.001)
-                continue
-            
-            last_capture_time = now
-            frame = self.capture.capture_frame()
-            
-            if frame is not None:
-                # Optimized duplicate check
-                is_duplicate = False
-                if last_frame is not None:
+
+        try:
+            while self.running:
+                # Windows follow their HWND; displays use their current desktop bounds.
+                if self.target_source:
                     try:
-                        # Slice check is very fast
-                        if np.array_equal(frame[10:30:2, 10:30:2], last_frame[10:30:2, 10:30:2]):
-                            if np.array_equal(frame[::60, ::60], last_frame[::60, ::60]):
-                                is_duplicate = True
-                    except: pass
-                
-                if not is_duplicate:
-                    if self.capture_queue.full():
-                        try: self.capture_queue.get_nowait()
+                        rect = get_source_rect(self.target_source)
+                        self.capture.region = rect # Update region
+                    except Exception as exc:
+                        print(f"Lost capture source, stopping: {exc}")
+                        self.running = False
+                        break
+
+                now = time.perf_counter()
+                if now - last_capture_time < capture_interval:
+                    time.sleep(0.001)
+                    continue
+
+                last_capture_time = now
+                rect = self.capture.region
+                if rect[2] <= rect[0] or rect[3] <= rect[1]:
+                    continue
+                frame = self.capture.capture_frame()
+
+                if frame is not None:
+                    # Optimized duplicate check
+                    is_duplicate = False
+                    if last_frame is not None:
+                        try:
+                            # Slice check is very fast
+                            if np.array_equal(frame[10:30:2, 10:30:2], last_frame[10:30:2, 10:30:2]):
+                                if np.array_equal(frame[::60, ::60], last_frame[::60, ::60]):
+                                    is_duplicate = True
                         except: pass
-                    self.capture_queue.put(frame)
-                    last_frame = frame
+
+                    if not is_duplicate:
+                        if self.capture_queue.full():
+                            try: self.capture_queue.get_nowait()
+                            except: pass
+                        try:
+                            self.capture_queue.put_nowait(frame)
+                            last_frame = frame
+                        except Full:
+                            pass
+        finally:
+            # Release DXGI/GDI resources on the same worker that used them.
+            self.capture.stop_capture()
 
 
     def post_processing_worker(self):
@@ -175,22 +186,32 @@ class FrameGenerationApp:
 
     def select_game(self):
         ui = GameSelectorUI()
-        self.target_window = ui.get_selection()
-        if not self.target_window:
+        self.target_source = ui.get_selection()
+        if not self.target_source:
             return False
         
-        # Re-initialize capture with correct mode
-        self.capture = ScreenCapture(mode=self.target_window["mode"])
-        self.target_fps = self.target_window["fps"]
+        # Resolve the selection before initializing GPU/capture resources.
+        try:
+            rect = get_source_rect(self.target_source)
+            monitor_rect = get_source_monitor_rect(self.target_source)
+            if rect[2] <= rect[0] or rect[3] <= rect[1]:
+                raise ValueError("A fonte selecionada não tem uma área válida.")
+        except Exception as exc:
+            messagebox.showerror("Fonte indisponível", str(exc))
+            return False
+        self.capture = ScreenCapture(
+            region=rect, mode=self.target_source["mode"], desktop_coordinates=True,
+        )
+        self.target_fps = self.target_source["fps"]
         
         # Scaling config
-        scale_val = self.target_window["scale"]
+        scale_val = self.target_source["scale"]
         if scale_val == "Fullscreen":
             self.scale_factor = -1 # Special flag for fullscreen
         else:
             self.scale_factor = float(scale_val)
             
-        algo_val = self.target_window["algo"]
+        algo_val = self.target_source["algo"]
         if algo_val == "Bilinear": self.upscale_algo = cv2.INTER_LINEAR
         elif algo_val == "Bicubic": self.upscale_algo = cv2.INTER_CUBIC
         elif algo_val == "Lanczos": self.upscale_algo = cv2.INTER_LANCZOS4
@@ -200,11 +221,11 @@ class FrameGenerationApp:
             self.ai_mode = True
             self.ai_upscaler = NvidiaAIUpscaler()
             
-        self.fg_enabled = self.target_window.get("fg_enabled", True)
+        self.fg_enabled = self.target_source.get("fg_enabled", True)
         
-        self.sharpness = self.target_window["sharpness"] / 100.0 * 2.0 # Scale 0-100 to 0.0-2.0
-        self.ultra_smooth = self.target_window.get("ultra_smooth", False)
-        if self.target_window.get("engine_type") == "AI (RIFE ONNX)":
+        self.sharpness = self.target_source["sharpness"] / 100.0 * 2.0 # Scale 0-100 to 0.0-2.0
+        self.ultra_smooth = self.target_source.get("ultra_smooth", False)
+        if self.target_source.get("engine_type") == "AI (RIFE ONNX)":
             self.engine = RIFEONNXEngine()
         else:
             self.engine = RIFEEngine()
@@ -212,17 +233,13 @@ class FrameGenerationApp:
         self.engine.set_high_precision(self.ultra_smooth) if hasattr(self.engine, 'set_high_precision') else None
         
         # Adaptive Buffer based on latency selection
-        self.low_latency = self.target_window.get("low_latency", True)
+        self.low_latency = self.target_source.get("low_latency", True)
         display_buf_size = 3 if self.low_latency else 15
         self.display_queue = Queue(maxsize=display_buf_size)
 
-        # Initial region
-        rect = WindowSelector.get_window_rect(self.target_window["hwnd"])
-        self.capture.region = rect
-        
         # Performance tuning: Set internal resolution limit
         # Performance Mode (Alta Res) uses 1280x720, Standard uses 800x600
-        max_w, max_h = (1280, 720) if self.target_window.get("performance_mode") else (800, 600)
+        max_w, max_h = (1280, 720) if self.target_source.get("performance_mode") else (800, 600)
         
         w, h = rect[2] - rect[0], rect[3] - rect[1]
         if w > max_w: self.internal_res = (max_w, max_h)
@@ -230,12 +247,11 @@ class FrameGenerationApp:
         
         # Initial display dimensions
         if self.scale_factor == -1:
-            info = win32api.GetSystemMetrics(win32con.SM_CXSCREEN), win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-            self.display_dim = info
+            self.display_dim = (monitor_rect[2] - monitor_rect[0], monitor_rect[3] - monitor_rect[1])
         else:
             self.display_dim = (int(w * self.scale_factor), int(h * self.scale_factor))
 
-        print(f"Targeting: {self.target_window['title']} | Mode: {self.target_window['mode']} | FPS: {self.target_fps} | Scale: {scale_val}")
+        print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | FPS: {self.target_fps} | Scale: {scale_val}")
         print("Press F11 to stop, F10 to toggle FPS.")
         return True
 
@@ -244,18 +260,13 @@ class FrameGenerationApp:
             return False
 
         pygame.init()
-        # Initial capture size
         rect = self.capture.region
-        w, h = rect[2] - rect[0], rect[3] - rect[1]
         
-        # Calculate display size
-        if self.scale_factor == -1: # Fullscreen
-            info = pygame.display.Info()
-            d_w, d_h = info.current_w, info.current_h
-            display_flags = pygame.NOFRAME | pygame.FULLSCREEN
-        else:
-            d_w, d_h = int(w * self.scale_factor), int(h * self.scale_factor)
-            display_flags = pygame.NOFRAME
+        # Borderless fullscreen on the source's monitor (including negative origins).
+        # Exclusive pygame.FULLSCREEN would default to the primary display.
+        d_w, d_h = self.display_dim
+        overlay_rect = get_source_monitor_rect(self.target_source) if self.scale_factor == -1 else rect
+        display_flags = pygame.NOFRAME
 
         if d_w <= 0 or d_h <= 0:
             print("Invalid window dimensions.")
@@ -282,11 +293,11 @@ class FrameGenerationApp:
         ex_style = win32gui.GetWindowLong(hwnd_pygame, win32con.GWL_EXSTYLE)
         win32gui.SetWindowLong(hwnd_pygame, win32con.GWL_EXSTYLE, ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
 
-        # 3. Set to Always On Top
-        if self.scale_factor == -1: # Fullscreen
-            win32gui.SetWindowPos(hwnd_pygame, win32con.HWND_TOPMOST, 0, 0, d_w, d_h, win32con.SWP_SHOWWINDOW)
-        else:
-            win32gui.SetWindowPos(hwnd_pygame, win32con.HWND_TOPMOST, rect[0], rect[1], d_w, d_h, win32con.SWP_SHOWWINDOW)
+        # 3. Set to Always On Top on the selected source's monitor.
+        win32gui.SetWindowPos(
+            hwnd_pygame, win32con.HWND_TOPMOST, overlay_rect[0], overlay_rect[1],
+            d_w, d_h, win32con.SWP_SHOWWINDOW,
+        )
         self.last_rect = rect
 
         # Increase process priority for better smoothness
@@ -302,7 +313,7 @@ class FrameGenerationApp:
         
         # Prepare config for sub-process
         engine_config = {
-            "engine_type": self.target_window.get("engine_type"),
+            "engine_type": self.target_source.get("engine_type"),
             "ultra_smooth": self.ultra_smooth,
             "fg_enabled": self.fg_enabled,
             "internal_res": self.internal_res
@@ -362,29 +373,37 @@ class FrameGenerationApp:
                     
                     # Window sync (minimal overhead)
                     try:
-                        t_rect = WindowSelector.get_window_rect(self.target_window["hwnd"])
+                        t_rect = get_source_rect(self.target_source)
                         if self.last_rect != t_rect:
                             t_w, t_h = t_rect[2] - t_rect[0], t_rect[3] - t_rect[1]
                             
                             # Update internal res cap immediately
-                            max_w, max_h = (1280, 720) if self.target_window.get("performance_mode") else (800, 600)
+                            max_w, max_h = (1280, 720) if self.target_source.get("performance_mode") else (800, 600)
                             if t_w > max_w: self.internal_res = (max_w, max_h)
                             else: self.internal_res = (t_w, t_h)
 
-                            if self.scale_factor != -1:
+                            overlay_rect = get_source_monitor_rect(self.target_source) if self.scale_factor == -1 else t_rect
+                            if self.scale_factor == -1:
+                                d_w, d_h = overlay_rect[2] - overlay_rect[0], overlay_rect[3] - overlay_rect[1]
+                            else:
                                 d_w, d_h = int(t_w * self.scale_factor), int(t_h * self.scale_factor)
-                                self.display_dim = (d_w, d_h)
-                                if screen.get_width() != d_w or screen.get_height() != d_h:
-                                    screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
-                                    hwnd_p = pygame.display.get_wm_info()["window"]
-                                    ctypes.windll.user32.SetWindowDisplayAffinity(hwnd_p, 0x00000011)
-                                    ex = win32gui.GetWindowLong(hwnd_p, win32con.GWL_EXSTYLE)
-                                    win32gui.SetWindowLong(hwnd_p, win32con.GWL_EXSTYLE, ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
-                                win32gui.SetWindowPos(hwnd_p, win32con.HWND_TOPMOST, t_rect[0], t_rect[1], d_w, d_h, win32con.SWP_NOACTIVATE)
+                            if d_w <= 0 or d_h <= 0:
+                                continue
+                            self.display_dim = (d_w, d_h)
+                            hwnd_p = pygame.display.get_wm_info()["window"]
+                            if screen.get_width() != d_w or screen.get_height() != d_h:
+                                screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
+                                hwnd_p = pygame.display.get_wm_info()["window"]
+                                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd_p, 0x00000011)
+                                ex = win32gui.GetWindowLong(hwnd_p, win32con.GWL_EXSTYLE)
+                                win32gui.SetWindowLong(hwnd_p, win32con.GWL_EXSTYLE, ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
+                            win32gui.SetWindowPos(hwnd_p, win32con.HWND_TOPMOST, overlay_rect[0], overlay_rect[1], d_w, d_h, win32con.SWP_NOACTIVATE)
                             self.last_rect = t_rect
                     except: pass
 
-                    # Blit and Flip (Now ultra-fast as frame is pre-processed)
+                    # A queued frame can still have the old size after a source resize.
+                    if (frame.shape[1], frame.shape[0]) != self.display_dim:
+                        frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
                     surface = pygame.image.frombuffer(frame.tobytes(), self.display_dim, 'RGB')
                     screen.blit(surface, (0, 0))
                     
@@ -436,15 +455,28 @@ class FrameGenerationApp:
         finally:
             self.running = False
             self.stop_event.set() # Stop the sub-process
-            self.capture.stop_capture()
+            t_cap.join()
+            t_post.join(timeout=2)
+            p_proc.join(timeout=2)
+            if p_proc.is_alive():
+                p_proc.terminate()
+                p_proc.join()
+            for queue in (self.capture_queue, self.process_queue):
+                queue.cancel_join_thread()
+                queue.close()
             pygame.quit()
         
         return True
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    app = FrameGenerationApp(target_fps=60)
+    # Use physical pixel coordinates on mixed-DPI monitor layouts.
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        ctypes.windll.user32.SetProcessDPIAware()
     while True:
+        app = FrameGenerationApp(target_fps=60)
         if not app.run():
             break
         print("Waiting for next selection...")

@@ -22,7 +22,34 @@ Unlike most frame generation tools that need to be "inside" the game (using its 
 
 ---
 
-## Setup Guide
+## Download the Windows app (no local build needed)
+
+GitHub Actions builds a standalone Windows x64 executable on every push and pull
+request to `master`. Python does **not** need to be installed to run the downloaded app.
+
+1. Open the repository's **Actions** tab and select **Build Windows executable**.
+2. Open a successful run for the branch/commit you want.
+3. Under **Artifacts**, download **FreeLossless-Windows-x64** (sign in to GitHub).
+4. Extract the ZIP and run `FreeLossless.exe`.
+
+Artifacts are kept for 30 days. After the workflow is merged into the default
+branch, you can also use **Run workflow** to build it manually. The executable is
+unsigned, so Windows SmartScreen may show a warning; only run builds you trust.
+
+## Choose what to capture
+
+- **Janela (app/jogo)**: select a visible application/game window.
+- **Display/Monitor**: select an entire monitor, such as **Display 1** or
+  **Display 2**. The actual primary monitor is marked **Monitor principal**; display
+  numbers follow Windows and the primary monitor is not necessarily Display 1.
+- Use **Refresh List** after opening a window or connecting/disconnecting a monitor.
+- **Backend de captura** still selects DXCAM or BitBlt; it is independent of the
+  capture source. DXCAM falls back to BitBlt if an output is unavailable or a window
+  spans monitors.
+- **Fullscreen** puts a borderless overlay on the selected source's monitor,
+  rather than always using the primary screen. Press **F11** to return to the menu.
+
+## Setup Guide (developers / running from source)
 
 ### 1. Create a Virtual Environment
 ```powershell
@@ -44,12 +71,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Building the Executable
-To create a standalone `.exe`:
+## Building the Executable Locally (optional)
+The Actions workflow runs this same command on Windows. To build locally:
 ```powershell
 python build_app.py
 ```
-The executable will be generated in the `dist` folder and will be around 2.63 GB.
+The executable will be generated at `dist/FreeLossless.exe`, including the bundled models.
 
 ---
 
