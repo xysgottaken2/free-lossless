@@ -12,6 +12,7 @@ CAPTURE_MODES = ("bitblt", "dxcam")
 SCALE_OPTIONS = ("1.0", "1.25", "1.5", "2.0", "Fullscreen")
 # Canonical preset names, kept here so the settings module never imports OpenCV.
 FILTER_PRESETS = ("Off", "Soft", "Sharp", "Vivid")
+DISPLAY_MODES = ("GDI", "D3D11")
 
 ALGORITHM_OPTIONS = (
     "Bilinear", "Bicubic", "Lanczos", "FSR 1.0 / CAS (Nitidez)", "NVIDIA AI SuperRes",
@@ -40,6 +41,9 @@ DEFAULT_SETTINGS = {
     "fg_enabled": True,
     # Post-processing filters applied by the overlay itself (see effects.py).
     "filter_preset": "Off",
+    # How the overlay presents its image. "D3D11" gives the process a Direct3D
+    # swapchain, which is what ReShade can hook; "GDI" is the compatible default.
+    "display_mode": "GDI",
     # Image filters (sharpening and the upscale algorithm) can be switched off to
     # compare the raw image, exactly like frame generation can.
     "filters_enabled": True,
@@ -117,6 +121,7 @@ def normalize_settings(data):
         "algo": ALGORITHM_OPTIONS,
         "engine_type": ENGINE_OPTIONS,
         "filter_preset": FILTER_PRESETS,
+        "display_mode": DISPLAY_MODES,
     }
     for key, options in choices.items():
         if isinstance(data.get(key), str) and data[key] in options:

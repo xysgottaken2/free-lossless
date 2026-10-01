@@ -22,6 +22,15 @@ Unlike most frame generation tools that need to be "inside" the game (using its 
 
 ---
 
+## Funcionam juntos?
+
+| Recurso | Onde roda | Precisa de D3D11? |
+| --- | --- | --- |
+| Interpolação de quadros (RIFE / DIS) | overlay | não |
+| Filtros internos (nitidez, vibrance, claridade) | overlay | não |
+| ReShade (qualquer efeito, inclusive LUTs) | overlay, via hook D3D11 | sim |
+| ReShade no jogo (antes da captura) | jogo | não |
+
 ## Build em pasta (abre bem mais rápido)
 
 O artifact do CI traz **duas versões**:
@@ -195,6 +204,32 @@ upscale de IA leva centenas de milissegundos; para o overlay nunca virar um slid
   placeholder inválido, então o filtro não fazia nada.
 - A conversão **YCbCr** usada no treino do modelo está embutida no grafo ONNX: o app
   entrega RGB e a conversão roda na GPU, sem custo na CPU.
+
+## ReShade rodando no overlay (modo D3D11)
+
+O ReShade **pode** ser injetado no overlay — é a mesma técnica do Magpie e do Lossless
+Scaling: o app passa a apresentar a imagem por **Direct3D 11** em vez de GDI, e o
+ReShade instalado na pasta do app hooka esse processo normalmente. Em **RESHADE (D3D11)**
+no menu:
+
+1. **Como o overlay desenha → D3D11 (permite o ReShade hookar o overlay)**. A janela
+   continua sendo a mesma (click-through, sempre no topo, fora das capturas); só a
+   apresentação muda. Se a máquina recusar D3D11, o overlay **cai sozinho para GDI** e
+   registra o motivo no log — ele nunca deixa de abrir.
+2. **Baixar instalador do ReShade** — o app baixa o instalador oficial (resolve a versão
+   atual na página do ReShade; a lista de downloads só mantém a última versão, então
+   fixar uma URL quebraria a cada lançamento) e mostra onde ele está.
+3. Execute o instalador e escolha **FreeLossless.exe** na lista. O status no menu passa a
+   mostrar `ReShade encontrado na pasta do app (dxgi.dll, ReShade.ini): seus efeitos valem
+   para a imagem do overlay`.
+
+Com isso, os efeitos do ReShade (LumaSharpen, Vibrance, LUTs, grão, bloom…) rodam **na
+imagem do overlay**, em qualquer jogo — porque o jogo nunca é tocado: o overlay só
+mostra a imagem que já captura. ReShade não é redistribuído junto com o app; o download
+usa a página oficial.
+
+Os filtros internos de **FILTROS EXTERNOS** continuam disponíveis e não precisam de
+ReShade (nem de D3D11).
 
 ## Filtros externos (estilo ReShade)
 

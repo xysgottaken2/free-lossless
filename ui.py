@@ -1,12 +1,14 @@
 import os
+import sys
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-import effects
 import i18n
+import reshade
 from selector import WindowSelector, DisplaySelector
 from settings import (
-    ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, ENGINE_OPTIONS, FILTER_PRESETS,
+    ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, DISPLAY_MODES, ENGINE_OPTIONS, FILTER_PRESETS,
     HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
     MULTIPLIER_MIN, MULTIPLIER_STEP, SCALE_OPTIONS, SettingsStore,
     hotkey_conflicts, normalize_settings, source_identity,
@@ -27,6 +29,7 @@ ALGORITHM_HINT_KEYS = {
     "FSR 1.0 / CAS (Nitidez)": "algo.hint.fsr",
     "NVIDIA AI SuperRes": "algo.hint.ai",
 }
+DISPLAY_MODE_LABEL_KEYS = {"GDI": "display.gdi", "D3D11": "display.d3d11"}
 FILTER_LABEL_KEYS = {
     "Off": "filter.off",
     "Soft": "filter.soft",
@@ -50,7 +53,7 @@ class GameSelectorUI:
         "source_type": "source_var", "mode": "mode_var", "fps": "fps_var",
         "scale": "scale_var", "algo": "algo_var", "sharpness": "sharp_var",
         "fg_enabled": "fg_var", "filters_enabled": "filters_var", "engine_type": "engine_var",
-        "filter_preset": "filter_var",
+        "filter_preset": "filter_var", "display_mode": "display_mode_var",
         "ultra_smooth": "ultra_smooth_var", "performance_mode": "perf_mode_var",
         "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
         "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
@@ -113,6 +116,7 @@ class GameSelectorUI:
 
         self._setup_style()
         self._setup_ui()
+        self._refresh_reshade_status()
         self._refresh_list()
         self._update_setting_display()
         for name in self.SETTING_VARIABLES.values():
@@ -439,7 +443,23 @@ class GameSelectorUI:
         self.sharp_scale = self._slider(image, self.sharp_var, 0, 100)
         self.sharp_scale.grid(row=7, column=0, sticky="ew", pady=(6, 8))
 
-        filters = self._section(parent, _t("section.filters"), 2)
+        reshade_section = self._section(parent, _t("section.reshade"), 2)
+        self._label(reshade_section, _t("field.display_mode"), size=9).grid(row=1, column=0, sticky="w",
+                                                                           pady=(0, 6))
+        mode_labels = {value: _t(DISPLAY_MODE_LABEL_KEYS[value]) for value in DISPLAY_MODES}
+        self.display_mode_combo = self._linked_combo(reshade_section, self.display_mode_var, mode_labels)
+        self.display_mode_combo.grid(row=2, column=0, sticky="ew")
+        self._label(reshade_section, _t("display.hint"), muted=True, size=9,
+                    justify=tk.LEFT).grid(row=3, column=0, sticky="w", pady=(4, 8))
+        self.reshade_status_var = tk.StringVar(self.root)
+        self.reshade_status_label = self._label(reshade_section, textvariable=self.reshade_status_var,
+                                                muted=True, size=9, justify=tk.LEFT)
+        self.reshade_status_label.grid(row=4, column=0, sticky="w")
+        self.reshade_button = self._button(reshade_section, _t("reshade.download"),
+                                           self._download_reshade)
+        self.reshade_button.grid(row=5, column=0, sticky="w", pady=(8, 0))
+
+        filters = self._section(parent, _t("section.filters"), 3)
         self._label(filters, _t("field.filter_preset"), size=9).grid(row=1, column=0, sticky="w",
                                                                      pady=(0, 6))
         filter_labels = {value: _t(FILTER_LABEL_KEYS[value]) for value in FILTER_PRESETS}
@@ -453,7 +473,7 @@ class GameSelectorUI:
                                               muted=True, size=9, justify=tk.LEFT)
         self.reshade_hint_label.grid(row=4, column=0, sticky="w", pady=(4, 0))
 
-        generation = self._section(parent, _t("section.frame_generation"), 3)
+        generation = self._section(parent, _t("section.frame_generation"), 4)
         self.fg_check = self._toggle_row(generation, 1, _t("toggle.interpolation"),
                                         _t("toggle.interpolation_hint"), self.fg_var)
         engine_labels = {value: _t(ENGINE_LABEL_KEYS[value]) for value in ENGINE_OPTIONS}
@@ -473,7 +493,7 @@ class GameSelectorUI:
         self.multiplier_hint_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
         generation.bind("<Configure>", lambda event: self.multiplier_hint_label.config(
             wraplength=max(200, event.width - 24)))
-        advanced = self._section(parent, _t("section.advanced"), 4)
+        advanced = self._section(parent, _t("section.advanced"), 5)
         self.ultra_smooth_check = self._toggle_row(advanced, 1, _t("toggle.ultra_smooth"),
                                                    _t("toggle.ultra_smooth_hint"), self.ultra_smooth_var)
         self.perf_mode_check = self._toggle_row(advanced, 2, _t("toggle.performance"),
@@ -763,9 +783,9 @@ class GameSelectorUI:
     def _refresh_reshade_hint(self):
         """Tell the user when the selected game already runs ReShade.
 
-        Nothing is installed or injected: the overlay captures the game's final image,
-        so whatever ReShade is doing in there already reaches this preview. Knowing it
-        avoids trying to stack the same look twice.
+        Nothing is installed or injected into the game: the overlay captures the game's
+        final image, so whatever ReShade does in there already reaches this preview.
+        Knowing it avoids trying to stack the same look twice.
         """
         source = self.selected_source or {}
         process = source.get("process") if source.get("source_type") == "window" else None
@@ -773,7 +793,7 @@ class GameSelectorUI:
             self.reshade_hint_var.set("")
             return
         try:
-            _directory, files = effects.reshade_installed(process)
+            _directory, files = reshade.installed_for_process(process)
         except Exception:
             files = []
         if files:
@@ -781,6 +801,47 @@ class GameSelectorUI:
             self.reshade_hint_label.config(fg=COLORS["success"])
         else:
             self.reshade_hint_var.set("")
+
+    def _refresh_reshade_status(self):
+        """Show whether this app folder already has ReShade installed."""
+        try:
+            found = reshade.detect()
+        except Exception:
+            found = []
+        if found:
+            self.reshade_status_var.set(_t("reshade.found", files=", ".join(found[:3])))
+            self.reshade_status_label.config(fg=COLORS["success"])
+        else:
+            self.reshade_status_var.set(_t("reshade.missing"))
+            self.reshade_status_label.config(fg=COLORS["muted"])
+
+    def _download_reshade(self):
+        """Fetch ReShade's own installer next to the app, in the background.
+
+        ReShade is installed by its installer, not by us: the download only saves the
+        file and shows where it is, because the DLL must be placed by the user in the
+        folder of the program that will be hooked.
+        """
+        self.reshade_button.config(state=tk.DISABLED)
+        self.reshade_status_var.set(_t("reshade.downloading"))
+        self.reshade_status_label.config(fg=COLORS["accent"])
+
+        def worker():
+            path, error = reshade.download_installer()
+            self.root.after(0, lambda: self._reshade_download_finished(path, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reshade_download_finished(self, path, error):
+        self.reshade_button.config(state=tk.NORMAL)
+        if error:
+            self.reshade_status_var.set(_t("reshade.failed", error=error))
+            self.reshade_status_label.config(fg=COLORS["warning"])
+            return
+        exe = "FreeLossless.exe" if getattr(sys, "frozen", False) else "FreeLossless.exe (build)"
+        self.reshade_status_var.set(_t("reshade.downloaded", path=str(path), exe=exe))
+        self.reshade_status_label.config(fg=COLORS["success"])
+        reshade.open_folder(path)
 
     def _update_setting_display(self):
         fps = self.fps_var.get()

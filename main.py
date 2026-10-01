@@ -27,6 +27,7 @@ GameSelectorUI = None
 get_source_rect = get_source_monitor_rect = None
 AMDFilters = NvidiaAIUpscaler = None
 EffectChain = None
+create_display = D3D11 = None
 win32gui = win32con = win32api = None
 
 
@@ -38,6 +39,7 @@ def load_runtime():
     """Import the overlay dependencies. Calling it twice is harmless."""
     global cv2, np, pygame, ScreenCapture, RIFEEngine, RIFEONNXEngine, GameSelectorUI
     global get_source_rect, get_source_monitor_rect, AMDFilters, NvidiaAIUpscaler, EffectChain
+    global create_display, D3D11
     global win32gui, win32con, win32api
     if runtime_loaded():
         return
@@ -49,6 +51,7 @@ def load_runtime():
     import win32gui as win32gui_module
     from capture import ScreenCapture as capture_class
     from effects import EffectChain as effect_chain_class
+    from d3d_display import create_display as display_factory, D3D11 as d3d11_mode
     from engine import RIFEEngine as fast_engine, RIFEONNXEngine as ai_engine
     from filters import AMDFilters as amd_filters, NvidiaAIUpscaler as nvidia_upscaler
     from selector import (get_source_monitor_rect as monitor_rect_function,
@@ -60,6 +63,7 @@ def load_runtime():
     RIFEEngine, RIFEONNXEngine = fast_engine, ai_engine
     AMDFilters, NvidiaAIUpscaler = amd_filters, nvidia_upscaler
     EffectChain = effect_chain_class
+    create_display, D3D11 = display_factory, d3d11_mode
     get_source_rect, get_source_monitor_rect = source_rect_function, monitor_rect_function
     GameSelectorUI = selector_ui
 
@@ -415,6 +419,10 @@ class FrameGenerationApp:
         self.filters_enabled = True
         # Filter preset applied by the overlay itself (effects.py).
         self.filter_chain = None
+        # How the overlay presents: "GDI" (pygame software blit) or "D3D11", which gives
+        # the process a Direct3D swapchain so ReShade can hook it.
+        self.display_mode = "GDI"
+        self.display_presenter = None
 
     def capture_worker(self):
         print("Capture worker started")
@@ -650,6 +658,50 @@ class FrameGenerationApp:
             print(message)
             diagnostics.write_now("ia", message)
 
+    def _overlay_window_handle(self):
+        """Win32 handle of the overlay window, for the click-through styles."""
+        presenter = getattr(self, "display_presenter", None)
+        if presenter is not None:
+            handle = presenter.hwnd()
+            if handle:
+                return handle
+        try:
+            return pygame.display.get_wm_info()["window"]
+        except Exception:
+            return None
+
+    def _present_overlay(self, screen):
+        """Flip the overlay: the SDL renderer when opted in, pygame's blit otherwise."""
+        presenter = getattr(self, "display_presenter", None)
+        if presenter is None:
+            pygame.display.flip()
+            return
+        presenter.present()
+
+    def _open_overlay_display(self, size):
+        """Open the overlay window in the configured mode, falling back to GDI.
+
+        D3D11 exists so ReShade can attach to the overlay (it hooks Direct3D, not the
+        GDI blits pygame does by default). If the machine cannot give us a D3D
+        swapchain, the overlay still opens — in GDI, with the reason in the log.
+        """
+        title = i18n.translate("app.title")
+        requested = getattr(self, "display_mode", "GDI")
+        if requested == D3D11:
+            try:
+                canvas, presenter, _ = create_display(D3D11, title, size)
+                message = (f"exibição: D3D11 via SDL ({presenter.driver}) · o ReShade instalado "
+                           f"nesta pasta passa a valer para o overlay")
+                print(f"[exibição] {message}")
+                diagnostics.write_now("exibição", message)
+                return canvas, presenter
+            except Exception as exc:
+                message = f"modo D3D11 indisponível ({exc}): caindo para GDI nesta sessão"
+                print(f"[exibição] {message}")
+                diagnostics.write_now("exibição", message)
+        canvas, presenter, _ = create_display("GDI", title, size)
+        return canvas, presenter
+
     def _apply_overlay_window_style(self, rect, size):
         """Make the overlay click-through, always on top and invisible to captures.
 
@@ -658,9 +710,13 @@ class FrameGenerationApp:
         cases used to leave the overlay grabbing the mouse, so the styles are applied
         again on every geometry change and periodically while it runs.
         """
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-        except Exception:
+        hwnd = self._overlay_window_handle()
+        if not hwnd:
+            if not getattr(self, "_window_handle_warned", False):
+                self._window_handle_warned = True
+                diagnostics.write_now("exibição", "não foi possível obter o handle da janela do "
+                                                 "overlay: click-through e sempre-no-topo não "
+                                                 "puderam ser aplicados")
             return
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
@@ -782,6 +838,8 @@ class FrameGenerationApp:
             self.ai_upscaler = NvidiaAIUpscaler()
 
         self.filter_chain = EffectChain(self.target_source.get("filter_preset", "Off"))
+        self.display_mode = self.target_source.get("display_mode", "GDI")
+        self.display_presenter = None
         self.ultra_smooth = self.target_source.get("ultra_smooth", False)
         if self.target_source.get("engine_type") == "AI (RIFE ONNX)":
             self.engine = RIFEONNXEngine()
@@ -920,15 +978,13 @@ class FrameGenerationApp:
         # Exclusive pygame.FULLSCREEN would default to the primary display.
         d_w, d_h = self.display_dim
         overlay_rect = get_source_monitor_rect(self.target_source) if self.scale_factor == -1 else rect
-        display_flags = pygame.NOFRAME
 
         if d_w <= 0 or d_h <= 0:
             print("Invalid window dimensions.")
             return True
 
         # Setup Borderless Window
-        screen = pygame.display.set_mode((d_w, d_h), display_flags)
-        pygame.display.set_caption(i18n.translate("app.title"))
+        screen, self.display_presenter = self._open_overlay_display((d_w, d_h))
         
         # FPS Font
         pygame.font.init()
@@ -1090,7 +1146,10 @@ class FrameGenerationApp:
                                 continue
                             self.display_dim = (d_w, d_h)
                             if screen.get_width() != d_w or screen.get_height() != d_h:
-                                screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
+                                if self.display_presenter is not None:
+                                    screen = self.display_presenter.resize((d_w, d_h))
+                                else:
+                                    screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
                             self._apply_overlay_window_style(overlay_rect, (d_w, d_h))
                             self.last_rect = t_rect
                     except: pass
@@ -1130,7 +1189,7 @@ class FrameGenerationApp:
                             print(f"Status panel disabled: {exc}")
                             self.show_fps = False
 
-                    pygame.display.flip()
+                    self._present_overlay(screen)
                     
                     self.frame_count += 1
                     fps_window_frames += 1
@@ -1152,6 +1211,9 @@ class FrameGenerationApp:
             for queue in (self.capture_queue, self.process_queue):
                 queue.cancel_join_thread()
                 queue.close()
+            if self.display_presenter is not None:
+                self.display_presenter.close()
+                self.display_presenter = None
             pygame.quit()
         
         return True

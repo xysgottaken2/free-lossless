@@ -43,7 +43,7 @@ jobs:
           # Tests exercise every module; they must not write to a real overlay.log.
           FREE_LOSSLESS_LOG: '0'
         run: |
-          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py effects.py i18n.py theme.py splash.py diagnostics.py ort_providers.py build_app.py
+          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py effects.py d3d_display.py reshade.py i18n.py theme.py splash.py diagnostics.py ort_providers.py build_app.py
           if python -m unittest discover -s tests -v > unittest.log 2>&1; then
             cat unittest.log
           else
@@ -96,4 +96,8 @@ jobs:
         shell: bash
         run: |
           echo "single file:" && ls -la release/single-file
-          echo "portable:" && du -sh release/portable && ls release/portable | head
+          echo "portable:" && du -sh release/portable && ls release/portable | head -20
+          echo "SDL2 (D3D11) e bindings _sdl2 no pacote:"
+          ls release/portable | grep -i sdl2 || (echo "SDL2.dll ausente" && exit 1)
+          ls release/portable/_internal/pygame/_sdl2/*.pyd release/portable/_internal/pygame/_sdl2/*.dll 2>/dev/null \
+            || (echo "bindings _sdl2 ausentes: o modo D3D11 nao funcionaria" && exit 1)

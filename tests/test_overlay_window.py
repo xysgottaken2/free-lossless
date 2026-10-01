@@ -34,6 +34,7 @@ class OverlayWindowStyleTests(unittest.TestCase):
         self.deps["win32con"].SWP_NOACTIVATE = 0x0010
         self.deps["win32con"].SWP_SHOWWINDOW = 0x0040
         self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.display_presenter = None
         self.app._apply_overlay_window_style((10, 20), (1920, 1080))
 
     def test_the_window_becomes_click_through_and_never_activates(self):
@@ -98,3 +99,83 @@ class StyleRefreshCadenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OverlayDisplayModeTests(unittest.TestCase):
+    """GDI by default, D3D11 when asked for, automatic fallback when refused."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+
+    def setUp(self):
+        self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.display_mode = "GDI"
+        self.app.display_presenter = None
+        self.calls = []
+
+        def factory(mode, title, size):
+            self.calls.append(mode)
+            if mode == "D3D11" and getattr(self, "d3d11_fails", False):
+                raise RuntimeError("sem D3D11 nesta máquina")
+            presenter = MagicMock() if mode == "D3D11" else None
+            if presenter is not None:
+                presenter.driver = "d3d11"
+            return f"canvas-{mode}", presenter, f"desc-{mode}"
+
+        self.factory = factory
+        patches = [patch.object(self.module, "create_display", factory),
+                   patch.object(self.module, "D3D11", "D3D11")]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_gdi_is_the_default_and_needs_no_presenter(self):
+        canvas, presenter = self.app._open_overlay_display((640, 480))
+        self.assertEqual(self.calls, ["GDI"])
+        self.assertEqual(canvas, "canvas-GDI")
+        self.assertIsNone(presenter)
+
+    def test_d3d11_is_used_when_configured(self):
+        self.app.display_mode = "D3D11"
+        canvas, presenter = self.app._open_overlay_display((640, 480))
+        self.assertEqual(self.calls, ["D3D11"])
+        self.assertEqual(canvas, "canvas-D3D11")
+        self.assertIsNotNone(presenter)
+
+    def test_a_refused_swapchain_falls_back_to_gdi(self):
+        self.app.display_mode = "D3D11"
+        self.d3d11_fails = True
+        canvas, presenter = self.app._open_overlay_display((640, 480))
+        self.assertEqual(self.calls, ["D3D11", "GDI"])
+        self.assertEqual(canvas, "canvas-GDI")
+        self.assertIsNone(presenter)
+
+    def test_presenting_uses_the_renderer_when_there_is_one(self):
+        presenter = MagicMock()
+        self.app.display_presenter = presenter
+        self.deps["pygame"].display.reset_mock(return_value=True, side_effect=True)
+        self.app._present_overlay("tela")
+        presenter.present.assert_called_once_with()
+        self.deps["pygame"].display.flip.assert_not_called()
+
+    def test_presenting_uses_the_display_module_without_a_presenter(self):
+        self.deps["pygame"].display.reset_mock(return_value=True, side_effect=True)
+        self.app._present_overlay("tela")
+        self.assertTrue(self.deps["pygame"].display.flip.called)
+
+    def test_the_window_handle_comes_from_the_renderer(self):
+        presenter = MagicMock()
+        presenter.hwnd.return_value = 777
+        self.app.display_presenter = presenter
+        self.assertEqual(self.app._overlay_window_handle(), 777)
+
+    def test_the_window_handle_falls_back_to_the_display_module(self):
+        self.deps["pygame"].display.get_wm_info.return_value = {"window": 999}
+        self.assertEqual(self.app._overlay_window_handle(), 999)
+
+    def test_a_missing_handle_is_not_an_error(self):
+        self.deps["pygame"].display.get_wm_info.side_effect = Exception("sem janela")
+        self.assertIsNone(self.app._overlay_window_handle())

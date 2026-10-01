@@ -17,6 +17,9 @@ effects are the same ideas with the same names:
 * ``clarity`` — local contrast with a wide radius, the ReShade "Clarity" look.
 * ``contrast`` — gentle S-curve, applied through a lookup table.
 
+ReShade itself is handled by reshade.py: this module never touches the game, only the
+frame the overlay is about to show.
+
 Everything is 8-bit saturating maths at the internal resolution (before the
 upscale), so a preset costs a few milliseconds per frame instead of tens.
 """
@@ -187,44 +190,3 @@ class EffectChain:
                 diagnostics.write_now("filtros", f"{name} falhou e foi ignorado: {exc}")
                 continue
         return frame
-
-
-def reshade_files(directory):
-    """Files that show a ReShade installation in a game folder."""
-    import os
-
-    if not directory or not os.path.isdir(directory):
-        return []
-    found = []
-    for name in ("ReShade.ini", "ReShade64.dll", "reshade-shaders",
-                 "dxgi.dll", "d3d11.dll", "d3d9.dll", "opengl32.dll"):
-        if os.path.exists(os.path.join(directory, name)):
-            found.append(name)
-    return found
-
-
-def reshade_installed(process_name):
-    """Where ReShade is installed for a running game, if it can be found.
-
-    Returns ``(directory, files)`` or ``(None, [])``. Everything is best effort:
-    games that the user cannot read, or that run elevated, simply report nothing.
-    """
-    if not process_name:
-        return None, []
-    try:
-        import psutil
-
-        wanted = str(process_name).lower()
-        for process in psutil.process_iter(["name", "exe"]):
-            name = (process.info.get("name") or "").lower()
-            if name and name == wanted and process.info.get("exe"):
-                import os
-
-                directory = os.path.dirname(process.info["exe"])
-                files = reshade_files(directory)
-                if files:
-                    return directory, files
-                return None, []
-    except Exception:
-        return None, []
-    return None, []

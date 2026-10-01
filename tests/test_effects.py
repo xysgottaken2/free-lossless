@@ -167,32 +167,5 @@ class PresetTests(EffectBasicsTests):
                 self.assertLess(cost, 25.0, f"{name} custou {cost:.1f} ms por quadro")
 
 
-@unittest.skipIf(cv2 is None, "OpenCV is not installed")
-class ReShadeDiscoveryTests(unittest.TestCase):
-    def test_files_that_show_a_reshade_installation(self):
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(effects.reshade_files(directory), [])
-            (Path(directory) / "ReShade.ini").write_text("", encoding="utf-8")
-            (Path(directory) / "dxgi.dll").write_bytes(b"")
-            (Path(directory) / "reshade-shaders").mkdir()
-            found = effects.reshade_files(directory)
-            self.assertIn("ReShade.ini", found)
-            self.assertIn("dxgi.dll", found)
-            self.assertIn("reshade-shaders", found)
-
-    def test_a_missing_folder_or_process_is_not_an_error(self):
-        self.assertEqual(effects.reshade_files(None), [])
-        self.assertEqual(effects.reshade_files("/pasta/que/nao/existe"), [])
-        self.assertEqual(effects.reshade_installed(None), (None, []))
-
-    def test_looking_up_a_game_that_is_not_running_reports_nothing(self):
-        directory, files = effects.reshade_installed("jogo-que-nao-existe-12345.exe")
-        self.assertIsNone(directory)
-        self.assertEqual(files, [])
-
-
 if __name__ == "__main__":
     unittest.main()

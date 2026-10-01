@@ -74,6 +74,10 @@ def build(mode="onefile"):
         "--name", exe_name,
         "--noconsole", # GUI mode
         "--clean",
+        # The D3D11 presentation mode lives in pygame's private SDL2 bindings; PyInstaller
+        # finds them by import analysis, but they are cheap to ask for explicitly.
+        "--hidden-import", "pygame._sdl2",
+        "--hidden-import", "pygame._sdl2.video",
     ]
     if mode == "onefile":
         params.append("--onefile")

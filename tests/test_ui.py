@@ -20,9 +20,6 @@ class FakeVar:
 
 
 class SelectionUITests(unittest.TestCase):
-    def ui_module(self):
-        """The ui module this instance was loaded from (used for patching)."""
-        return self.module
 
     def setUp(self):
         i18n.set_language("en")
@@ -251,20 +248,20 @@ class SelectionUITests(unittest.TestCase):
     def test_the_reshade_hint_appears_only_for_a_game_that_has_it(self):
         from unittest.mock import patch
         self.ui.selected_source = {"source_type": "window", "process": "game.exe"}
-        with patch.object(self.ui_module(), "effects") as effects:
-            effects.reshade_installed.return_value = (r"C:\Game", ["ReShade.ini", "dxgi.dll"])
+        with patch.object(self.module, "reshade") as reshade:
+            reshade.installed_for_process.return_value = (r"C:\Game", ["ReShade.ini", "dxgi.dll"])
             self.ui._refresh_reshade_hint()
             self.assertIn("ReShade.ini", self.ui.reshade_hint_var.set.call_args.args[0])
-            effects.reshade_installed.return_value = (None, [])
+            reshade.installed_for_process.return_value = (None, [])
             self.ui._refresh_reshade_hint()
             self.assertEqual(self.ui.reshade_hint_var.set.call_args.args[0], "")
 
     def test_a_display_source_never_looks_for_reshade(self):
         from unittest.mock import patch
         self.ui.selected_source = {"source_type": "display", "device": r"\\.\DISPLAY1"}
-        with patch.object(self.ui_module(), "effects") as effects:
+        with patch.object(self.module, "reshade") as reshade:
             self.ui._refresh_reshade_hint()
-            effects.reshade_installed.assert_not_called()
+            reshade.installed_for_process.assert_not_called()
             self.assertEqual(self.ui.reshade_hint_var.set.call_args.args[0], "")
 
     def test_generation_settings_are_disabled_without_interpolation(self):
@@ -403,3 +400,51 @@ class SelectionUITests(unittest.TestCase):
             self.assertEqual(SettingsStore(path).load(), self.ui._collect_settings())
             self.assertEqual(SettingsStore(path).load()["sharpness"], 0)
             self.assertFalse(SettingsStore(path).load()["fg_enabled"])
+
+
+class ReshadeSectionTests(unittest.TestCase):
+    """The menu shows the drawing mode and whether ReShade can hook the overlay."""
+
+    def setUp(self):
+        # Reuse the harness without inheriting its tests (which would run twice).
+        SelectionUITests.setUp(self)
+        for name in ("display_mode_combo", "reshade_status_var", "reshade_status_label",
+                     "reshade_button"):
+            setattr(self.ui, name, MagicMock())
+
+    def test_the_drawing_mode_is_saved_and_reloaded(self):
+        self.ui.display_mode_var.value = "D3D11"
+        self.assertEqual(self.ui._collect_settings()["display_mode"], "D3D11")
+        self.ui.display_mode_var.value = "Outro"
+        self.assertEqual(self.ui._collect_settings()["display_mode"], "GDI")
+
+    def test_the_status_reports_reshade_next_to_the_app(self):
+        from unittest.mock import patch
+        with patch.object(self.module, "reshade") as reshade:
+            reshade.detect.return_value = ["ReShade.ini", "dxgi.dll"]
+            self.ui._refresh_reshade_status()
+            message = self.ui.reshade_status_var.set.call_args.args[0]
+            self.assertIn("ReShade.ini", message)
+            reshade.detect.return_value = []
+            self.ui._refresh_reshade_status()
+            self.assertIn("not installed", self.ui.reshade_status_var.set.call_args.args[0])
+
+    def test_downloading_updates_the_menu_when_it_finishes(self):
+        from unittest.mock import patch
+        self.ui.root = MagicMock()
+        self.ui.root.after.side_effect = lambda delay, callback: callback()
+        with patch.object(self.module, "reshade") as reshade:
+            reshade.download_installer.return_value = (r"C:\App\ReShade_Setup.exe", None)
+            self.ui._download_reshade()
+            self.assertIn("ReShade_Setup.exe", self.ui.reshade_status_var.set.call_args.args[0])
+            reshade.open_folder.assert_called_once()
+
+    def test_a_failed_download_is_shown_and_the_button_comes_back(self):
+        from unittest.mock import patch
+        self.ui.root = MagicMock()
+        self.ui.root.after.side_effect = lambda delay, callback: callback()
+        with patch.object(self.module, "reshade") as reshade:
+            reshade.download_installer.return_value = (None, "sem rede")
+            self.ui._download_reshade()
+            self.assertIn("sem rede", self.ui.reshade_status_var.set.call_args.args[0])
+            self.ui.reshade_button.config.assert_called_with(state=self.deps["tkinter"].NORMAL)
