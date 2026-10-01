@@ -26,6 +26,7 @@ RIFEEngine = RIFEONNXEngine = None
 GameSelectorUI = None
 get_source_rect = get_source_monitor_rect = None
 AMDFilters = NvidiaAIUpscaler = None
+EffectChain = None
 win32gui = win32con = win32api = None
 
 
@@ -36,7 +37,7 @@ def runtime_loaded():
 def load_runtime():
     """Import the overlay dependencies. Calling it twice is harmless."""
     global cv2, np, pygame, ScreenCapture, RIFEEngine, RIFEONNXEngine, GameSelectorUI
-    global get_source_rect, get_source_monitor_rect, AMDFilters, NvidiaAIUpscaler
+    global get_source_rect, get_source_monitor_rect, AMDFilters, NvidiaAIUpscaler, EffectChain
     global win32gui, win32con, win32api
     if runtime_loaded():
         return
@@ -47,6 +48,7 @@ def load_runtime():
     import win32con as win32con_module
     import win32gui as win32gui_module
     from capture import ScreenCapture as capture_class
+    from effects import EffectChain as effect_chain_class
     from engine import RIFEEngine as fast_engine, RIFEONNXEngine as ai_engine
     from filters import AMDFilters as amd_filters, NvidiaAIUpscaler as nvidia_upscaler
     from selector import (get_source_monitor_rect as monitor_rect_function,
@@ -57,8 +59,20 @@ def load_runtime():
     ScreenCapture = capture_class
     RIFEEngine, RIFEONNXEngine = fast_engine, ai_engine
     AMDFilters, NvidiaAIUpscaler = amd_filters, nvidia_upscaler
+    EffectChain = effect_chain_class
     get_source_rect, get_source_monitor_rect = source_rect_function, monitor_rect_function
     GameSelectorUI = selector_ui
+
+# Window styles of the overlay. WS_EX_TRANSPARENT makes it click-through and
+# WS_EX_NOACTIVATE keeps Windows from giving it focus (Win key, Alt+Tab and game
+# launchers all re-activate windows), which is what used to turn the overlay into a
+# window the user could grab and move.
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+# How often the window styles are re-applied while the overlay is running.
+WINDOW_STYLE_REFRESH_SECONDS = 0.5
 
 # Fallbacks keep the overlay usable if a saved hotkey is missing or invalid.
 DEFAULT_HOTKEY_VK = {"stop": 0x7A, "fps": 0x79, "fsr": 0x78}
@@ -375,6 +389,10 @@ class FrameGenerationApp:
         self.generated_fps = 0.0
         self.dropped_generated = 0
         self.last_frame_generated = False
+        # Cost of rendering live frames, and the budget it must fit (half a frame).
+        self.live_render_ms = 0.0
+        self.live_render_budget_ms = 0.0
+        self.live_degraded = False
         
         # Window & Performance management
         self.last_rect = None
@@ -391,6 +409,12 @@ class FrameGenerationApp:
         self.fsr_mode = False # Toggle for AMD CAS/EASU
         self.ai_mode = False # Toggle for NVIDIA AI SuperRes
         self.ai_upscaler = None
+        # Master switch for the image chain: sharpening, AI/FSR upscaling. When it is
+        # off the frames go to the display with a plain resize, so the user can see
+        # the raw image and compare.
+        self.filters_enabled = True
+        # Filter preset applied by the overlay itself (effects.py).
+        self.filter_chain = None
 
     def capture_worker(self):
         print("Capture worker started")
@@ -413,10 +437,13 @@ class FrameGenerationApp:
                         self.running = False
                         break
 
-                now = time.perf_counter()
-                if now - last_capture_time < interval:
-                    time.sleep(0.001)
+                # Sleep until the next capture instead of polling every millisecond:
+                # the wait is precise and the thread stays idle in between.
+                wait = interval - (time.perf_counter() - last_capture_time)
+                if wait > 0:
+                    time.sleep(min(wait, interval))
                     continue
+                now = time.perf_counter()
 
                 last_capture_time = now
                 rect = self.capture.region
@@ -465,14 +492,34 @@ class FrameGenerationApp:
         """Prepare a captured frame exactly like a generated one, for the fallback path.
 
         It goes through the same sharpening and upscale as a generated frame, so the
-        image does not change look when the two sources swap.
+        image does not change look when the two sources swap. If that rendering cannot
+        keep up with the capture rate, the cheap path (a plain resize) takes over for
+        the live frames: a slightly softer image at full frame rate beats a sharp one
+        that only updates a few times per second.
         """
+        started = time.perf_counter()
+        cheap = self.live_render_ms > self.live_render_budget_ms
         try:
-            display = self._render_for_display(frame)
+            display = self._cheap_render(frame) if cheap else self._render_for_display(frame)
         except Exception as exc:
             diagnostics.write_now("exibição", f"falha ao preparar frame ao vivo: {exc}")
             return
+        spent = (time.perf_counter() - started) * 1000.0
+        self.live_render_ms = (spent if self.live_render_ms <= 0
+                               else self.live_render_ms * 0.8 + spent * 0.2)
+        if not self.live_degraded and self.live_render_ms > self.live_render_budget_ms:
+            self.live_degraded = True
+            diagnostics.write_now("exibição", f"renderização dos frames ao vivo custa "
+                                              f"{self.live_render_ms:.1f} ms (limite "
+                                              f"{self.live_render_budget_ms:.1f} ms): usando o "
+                                              f"caminho simples para manter o FPS")
         put_latest(self.live_display_queue, display)
+
+    def _cheap_render(self, frame):
+        """Smallest possible path to the display: one resize, nothing else."""
+        if (frame.shape[1], frame.shape[0]) == self.display_dim:
+            return frame
+        return cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
 
     def _newest_live_frame(self):
         """Newest prepared capture; repeats the previous one instead of showing nothing."""
@@ -534,6 +581,35 @@ class FrameGenerationApp:
         self.last_frame_generated = from_generator
         return frame
 
+    def _measure_filter_chain(self):
+        """Log what the chosen filter preset costs per frame.
+
+        Filters are the user's choice, so a heavy preset is not disabled; the cost is
+        measured and written down, together with a warning when it takes more than the
+        frame budget, which is what a user would otherwise feel as stutter without
+        knowing where it came from.
+        """
+        if self.filter_chain is None or not self.filter_chain.enabled:
+            return
+        width, height = self.internal_res
+        sample = np.zeros((height, width, 3), dtype=np.uint8)
+        try:
+            self.filter_chain.apply(sample)
+            started = time.perf_counter()
+            self.filter_chain.apply(sample)
+            cost_ms = (time.perf_counter() - started) * 1000.0
+        except Exception as exc:
+            diagnostics.write_now("filtros", f"preset {self.filter_chain.preset} falhou: {exc}")
+            return
+        budget_ms = 1000.0 / max(1, self.target_fps)
+        message = (f"preset de filtros {self.filter_chain.preset}: {cost_ms:.1f} ms por quadro "
+                   f"em {width}x{height} (orçamento {budget_ms:.1f} ms a {self.target_fps} FPS)")
+        print(f"[filtros] {message}")
+        diagnostics.write_now("filtros", message)
+        if cost_ms > budget_ms:
+            diagnostics.write_now("filtros", "o preset escolhido custa mais que um intervalo de "
+                                            "quadro: use um preset mais leve ou abaixe os FPS de saída")
+
     def _prepare_ai_upscaler(self):
         """Measure the AI upscaler once and drop it when it cannot keep up.
 
@@ -542,7 +618,7 @@ class FrameGenerationApp:
         turned off for the session with the reason written to the log (and to the
         console), and the normal sharpening/upscale path takes over.
         """
-        if not (self.ai_mode and self.ai_upscaler):
+        if not (self.filters_enabled and self.ai_mode and self.ai_upscaler):
             return
         provider = ort_providers.describe(getattr(self.ai_upscaler, "session", None))
         if getattr(self.ai_upscaler, "session", None) is None:
@@ -574,6 +650,32 @@ class FrameGenerationApp:
             print(message)
             diagnostics.write_now("ia", message)
 
+    def _apply_overlay_window_style(self, rect, size):
+        """Make the overlay click-through, always on top and invisible to captures.
+
+        Windows resets a window's extended styles whenever SDL recreates it, and it
+        hands the window focus back when something like the Win key is pressed. Both
+        cases used to leave the overlay grabbing the mouse, so the styles are applied
+        again on every geometry change and periodically while it runs.
+        """
+        try:
+            hwnd = pygame.display.get_wm_info()["window"]
+        except Exception:
+            return
+        try:
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass  # only available on Windows 10 2004 and newer
+        try:
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            wanted = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            if wanted != style:
+                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, wanted)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, rect[0], rect[1], size[0], size[1],
+                                  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
+        except Exception as exc:
+            diagnostics.write_now("exibição", f"não foi possível ajustar a janela do overlay: {exc}")
+
     def _render_for_display(self, frame):
         """Sharpen at the processing resolution, then upscale once for the display.
 
@@ -581,6 +683,14 @@ class FrameGenerationApp:
         and tens of milliseconds per frame on a 1080p or larger display.
         """
         needs_upscale = (frame.shape[1], frame.shape[0]) != self.display_dim
+        if not self.filters_enabled:
+            if needs_upscale:
+                frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
+            return frame
+        # External (ReShade style) filters first, at the internal resolution: the same
+        # work at display resolution costs several times more per frame.
+        if self.filter_chain is not None and self.filter_chain.enabled:
+            frame = self.filter_chain.apply(frame)
         if self.ai_mode and self.ai_upscaler:
             frame = self.ai_upscaler.upscale(frame)
             if (frame.shape[1], frame.shape[0]) != self.display_dim:
@@ -598,11 +708,15 @@ class FrameGenerationApp:
         return frame
 
     def post_processing_worker(self):
-        """Prepare every generated frame for the display."""
+        """Prepare every generated frame for the display.
+
+        The queue is waited on, not polled: a 20 ms poll added up to 20 ms of delay
+        to every single frame, which is two and a half frame intervals at 120 FPS.
+        """
         print("Post-processing worker started")
         while self.running:
             try:
-                frame = self.process_queue.get(timeout=0.02)
+                frame = self.process_queue.get(timeout=0.2)
             except Empty:
                 continue
             try:
@@ -641,6 +755,10 @@ class FrameGenerationApp:
             self.scale_factor = float(scale_val)
             
         algo_val = self.target_source["algo"]
+        # Every session starts from a clean image configuration.
+        self.fsr_mode = False
+        self.ai_mode = False
+        self.ai_upscaler = None
         if algo_val == "Bilinear": self.upscale_algo = cv2.INTER_LINEAR
         elif algo_val == "Bicubic": self.upscale_algo = cv2.INTER_CUBIC
         elif algo_val == "Lanczos": self.upscale_algo = cv2.INTER_LANCZOS4
@@ -648,11 +766,22 @@ class FrameGenerationApp:
             self.fsr_mode = True
         elif "AI" in algo_val:
             self.ai_mode = True
-            self.ai_upscaler = NvidiaAIUpscaler()
-            
+
         self.fg_enabled = self.target_source.get("fg_enabled", True)
-        
+
+        self.filters_enabled = self.target_source.get("filters_enabled", True)
         self.sharpness = self.target_source["sharpness"] / 100.0 * 2.0 # Scale 0-100 to 0.0-2.0
+        if not self.filters_enabled:
+            # No image processing at all: no sharpening, FSR or neural upscale. The
+            # model is not even loaded, which also saves the seconds it takes to
+            # initialise a session.
+            self.fsr_mode = False
+            self.ai_mode = False
+            self.sharpness = 0.0
+        elif self.ai_mode:
+            self.ai_upscaler = NvidiaAIUpscaler()
+
+        self.filter_chain = EffectChain(self.target_source.get("filter_preset", "Off"))
         self.ultra_smooth = self.target_source.get("ultra_smooth", False)
         if self.target_source.get("engine_type") == "AI (RIFE ONNX)":
             self.engine = RIFEONNXEngine()
@@ -806,24 +935,9 @@ class FrameGenerationApp:
         font = pygame.font.SysFont("Arial", 24, bold=True)
         small_font = pygame.font.SysFont("Arial", 18, bold=True)
         
-        hwnd_pygame = pygame.display.get_wm_info()["window"]
-        
-        # 1. Exclude this window from screen capture (Win 10+)
-        try:
-            WDA_EXCLUDEFROMCAPTURE = 0x00000011
-            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd_pygame, WDA_EXCLUDEFROMCAPTURE)
-        except Exception as e:
-            print(f"Capture exclusion not available: {e}")
-
-        # 2. Make Click-Through
-        ex_style = win32gui.GetWindowLong(hwnd_pygame, win32con.GWL_EXSTYLE)
-        win32gui.SetWindowLong(hwnd_pygame, win32con.GWL_EXSTYLE, ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
-
-        # 3. Set to Always On Top on the selected source's monitor.
-        win32gui.SetWindowPos(
-            hwnd_pygame, win32con.HWND_TOPMOST, overlay_rect[0], overlay_rect[1],
-            d_w, d_h, win32con.SWP_SHOWWINDOW,
-        )
+        # Click-through, always on top on the source's monitor, and excluded from
+        # screen capture so the overlay can never capture itself.
+        self._apply_overlay_window_style(overlay_rect, (d_w, d_h))
         self.last_rect = rect
 
         # Increase process priority for better smoothness
@@ -856,6 +970,7 @@ class FrameGenerationApp:
         )
         t_post = threading.Thread(target=self.post_processing_worker, daemon=True)
         
+        self._measure_filter_chain()
         self._prepare_ai_upscaler()
 
         t_cap.start()
@@ -863,6 +978,9 @@ class FrameGenerationApp:
         t_post.start()
         
         frame_interval = 1.0 / self.target_fps
+        # Live frames are rendered in the capture thread: half a frame interval is what
+        # it may spend without holding the captures back.
+        self.live_render_budget_ms = max(1.0, frame_interval * 1000.0 * 0.5)
         # The generator needs to miss a whole frame before LIVE frames take over, and
         # it has to prove it recovered before generated frames come back. Without the
         # second delay the two sources alternate every frame, which the eye reads as
@@ -874,12 +992,14 @@ class FrameGenerationApp:
         fps_window_frames = 0
         generated_window = 0
         diagnostics_time = last_display_time
+        last_style_check = last_display_time
         self.sync_counter = 0
         diagnostics.reset()
         diagnostics.write_now("início", f"overlay {self.display_dim[0]}x{self.display_dim[1]} · "
                                         f"interno {self.internal_res[0]}x{self.internal_res[1]} · "
                                         f"{self.target_fps} FPS · geração x{self.frame_multiplier} · "
-                                        f"motor {self.target_source.get('engine_type')}")
+                                        f"motor {self.target_source.get('engine_type')} · "
+                                        f"filtros {'ligados' if self.filters_enabled else 'desligados'}")
 
         try:
             while self.running:
@@ -932,6 +1052,11 @@ class FrameGenerationApp:
                 # Buffer check: wait for at least 2 frames to be ready to absorb jitter
                 # in Low Latency mode, we are more aggressive
                 now = time.perf_counter()
+                # Windows can drop the styles or steal focus back (Win key, Alt+Tab,
+                # a game launcher): keep the overlay click-through and out of the way.
+                if now - last_style_check >= WINDOW_STYLE_REFRESH_SECONDS:
+                    last_style_check = now
+                    self._apply_overlay_window_style(self.last_rect or rect, self.display_dim)
                 min_buffer = 1 if self.low_latency else 3
                 frame = self._pick_frame(now, min_buffer, stall_timeout, return_delay)
 
@@ -964,14 +1089,9 @@ class FrameGenerationApp:
                             if d_w <= 0 or d_h <= 0:
                                 continue
                             self.display_dim = (d_w, d_h)
-                            hwnd_p = pygame.display.get_wm_info()["window"]
                             if screen.get_width() != d_w or screen.get_height() != d_h:
                                 screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
-                                hwnd_p = pygame.display.get_wm_info()["window"]
-                                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd_p, 0x00000011)
-                                ex = win32gui.GetWindowLong(hwnd_p, win32con.GWL_EXSTYLE)
-                                win32gui.SetWindowLong(hwnd_p, win32con.GWL_EXSTYLE, ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
-                            win32gui.SetWindowPos(hwnd_p, win32con.HWND_TOPMOST, overlay_rect[0], overlay_rect[1], d_w, d_h, win32con.SWP_NOACTIVATE)
+                            self._apply_overlay_window_style(overlay_rect, (d_w, d_h))
                             self.last_rect = t_rect
                     except: pass
 
@@ -995,9 +1115,12 @@ class FrameGenerationApp:
                     
                     if win32api.GetAsyncKeyState(self.hotkeys["fsr"]) & 0x8000:
                         if time.time() - self.hotkey_cooldown > 0.3:
-                            self.fsr_mode = not self.fsr_mode
+                            if self.filters_enabled:
+                                self.fsr_mode = not self.fsr_mode
+                                print(f"FSR Mode: {'ON' if self.fsr_mode else 'OFF'}")
+                            else:
+                                print("Image filters are off; enable them in the menu.")
                             self.hotkey_cooldown = time.time()
-                            print(f"FSR Mode: {'ON' if self.fsr_mode else 'OFF'}")
                     
                     if self.show_fps:
                         # Cosmetic only: a drawing problem must never stop the overlay.

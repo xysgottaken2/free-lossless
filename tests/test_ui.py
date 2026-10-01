@@ -20,6 +20,10 @@ class FakeVar:
 
 
 class SelectionUITests(unittest.TestCase):
+    def ui_module(self):
+        """The ui module this instance was loaded from (used for patching)."""
+        return self.module
+
     def setUp(self):
         i18n.set_language("en")
         self.addCleanup(i18n.set_language, "en")
@@ -30,7 +34,8 @@ class SelectionUITests(unittest.TestCase):
         for name in ("root", "tree", "list_label", "selector", "source_count_var", "empty_label",
                      "start_button", "selected_title_var", "selected_detail_var", "save_status_var", "save_dot",
                      "settings_store", "fps_value_var", "sharp_value_var", "engine_combo", "session_summary_var",
-                     "algo_hint_var"):
+                     "algo_hint_var", "algo_combo", "sharp_scale", "filters_hint_var", "filters_hint_label",
+                     "filter_combo", "filter_hint_var", "reshade_hint_var", "reshade_hint_label"):
             setattr(self.ui, name, MagicMock())
         self.ui.tree.get_children.return_value = ["stale-window"]
         self.ui.tree.selection.return_value = []
@@ -215,6 +220,52 @@ class SelectionUITests(unittest.TestCase):
         self.assertIn("capture at 4 FPS", hint)
         self.assertIn("GPU", hint)
         self.ui.multiplier_hint_label.config.assert_called_with(fg=self.module.COLORS["warning"])
+
+    def test_the_filter_toggle_disables_the_algorithm_and_the_sharpness(self):
+        self.ui.filters_var.value = False
+        self.ui._update_setting_display()
+        self.assertEqual(str(self.ui.algo_combo.configure.call_args.kwargs["state"]), "disabled")
+        self.assertEqual(self.ui.sharp_scale.configure.call_args.kwargs["state"],
+                         self.deps["tkinter"].DISABLED)
+        self.assertEqual(self.ui.filters_hint_var.set.call_args.args[0],
+                         "Image filters are off in this session.")
+
+    def test_the_filter_toggle_keeps_the_algorithm_when_it_is_on(self):
+        self.ui.filters_var.value = True
+        self.ui._update_setting_display()
+        self.assertEqual(str(self.ui.algo_combo.configure.call_args.kwargs["state"]), "readonly")
+        self.assertEqual(self.ui.filters_hint_var.set.call_args.args[0], "")
+
+    def test_the_filter_preference_is_saved_and_reloaded(self):
+        self.ui.filters_var.value = False
+        self.assertFalse(self.ui._collect_settings()["filters_enabled"])
+        self.ui.filters_var.value = True
+        self.assertTrue(self.ui._collect_settings()["filters_enabled"])
+
+    def test_the_filter_preset_is_saved_and_reloaded(self):
+        self.ui.filter_var.value = "Sharp"
+        self.assertEqual(self.ui._collect_settings()["filter_preset"], "Sharp")
+        self.ui.filter_var.value = "Nope"          # a hand-edited file falls back to Off
+        self.assertEqual(self.ui._collect_settings()["filter_preset"], "Off")
+
+    def test_the_reshade_hint_appears_only_for_a_game_that_has_it(self):
+        from unittest.mock import patch
+        self.ui.selected_source = {"source_type": "window", "process": "game.exe"}
+        with patch.object(self.ui_module(), "effects") as effects:
+            effects.reshade_installed.return_value = (r"C:\Game", ["ReShade.ini", "dxgi.dll"])
+            self.ui._refresh_reshade_hint()
+            self.assertIn("ReShade.ini", self.ui.reshade_hint_var.set.call_args.args[0])
+            effects.reshade_installed.return_value = (None, [])
+            self.ui._refresh_reshade_hint()
+            self.assertEqual(self.ui.reshade_hint_var.set.call_args.args[0], "")
+
+    def test_a_display_source_never_looks_for_reshade(self):
+        from unittest.mock import patch
+        self.ui.selected_source = {"source_type": "display", "device": r"\\.\DISPLAY1"}
+        with patch.object(self.ui_module(), "effects") as effects:
+            self.ui._refresh_reshade_hint()
+            effects.reshade_installed.assert_not_called()
+            self.assertEqual(self.ui.reshade_hint_var.set.call_args.args[0], "")
 
     def test_generation_settings_are_disabled_without_interpolation(self):
         self.ui.fg_var.value = False

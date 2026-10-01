@@ -8,6 +8,11 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy ships in requirements.txt
+    np = None
+
 from helpers import load_module, stubs
 
 
@@ -40,6 +45,7 @@ class AiUpscalerGateTests(unittest.TestCase):
         self.addCleanup(setattr, self.module.diagnostics, "ENABLED", True)
         self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
         self.app.ai_mode = True
+        self.app.filters_enabled = True
         self.app.ai_upscaler = FakeUpscaler()
         self.app.internal_res = (800, 600)
         self.app.target_fps = 120
@@ -85,6 +91,87 @@ class AiUpscalerGateTests(unittest.TestCase):
         self.app.ai_upscaler = upscaler
         self.app._prepare_ai_upscaler()
         upscaler.upscale.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class FilterToggleTests(unittest.TestCase):
+    """The image filters can be switched off entirely, like frame interpolation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+
+    def setUp(self):
+        self.module.diagnostics.ENABLED = False
+        self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.display_dim = (1920, 1080)
+        self.app.ai_mode = True
+        self.app.ai_upscaler = MagicMock()
+        self.app.fsr_mode = True
+        self.app.sharpness = 1.0
+        self.app.upscale_algo = 1
+        self.app.filters_enabled = False
+        self.app.filter_chain = None
+        self.deps["cv2"].reset_mock()
+        self.deps["filters"].reset_mock()
+
+    @staticmethod
+    def frame():
+        return np.zeros((600, 800, 3), dtype=np.uint8)
+
+    def test_frames_are_only_resized_when_the_filters_are_off(self):
+        self.app._render_for_display(self.frame())
+        self.deps["filters"].AMDFilters.apply_cas.assert_not_called()
+        self.deps["filters"].AMDFilters.apply_unsharp.assert_not_called()
+        self.deps["filters"].AMDFilters.apply_easu.assert_not_called()
+        self.app.ai_upscaler.upscale.assert_not_called()
+        # A plain resize is all that is left, straight to the display size.
+        self.assertEqual(self.deps["cv2"].resize.call_args.args[1], (1920, 1080))
+
+    def test_the_image_chain_runs_when_the_filters_are_on(self):
+        self.app.filters_enabled = True
+        self.app._render_for_display(self.frame())
+        self.app.ai_upscaler.upscale.assert_called_once()
+
+    def test_the_filter_gate_is_skipped_when_the_filters_are_off(self):
+        self.app.ai_upscaler = MagicMock()
+        self.app.ai_upscaler.upscale = MagicMock()
+        self.app.filters_enabled = False
+        self.app._prepare_ai_upscaler()
+        self.app.ai_upscaler.upscale.assert_not_called()
+
+    def test_disabling_the_filters_clears_the_ai_and_fsr_modes(self):
+        source = {"source_type": "window", "hwnd": 7, "title": "Game", "mode": "bitblt",
+                  "fps": 120, "scale": "1.0", "algo": "NVIDIA AI SuperRes", "sharpness": 40,
+                  "engine_type": "Fast (DIS Flow)", "filters_enabled": False, "fg_enabled": False}
+        self.deps["ui"].GameSelectorUI.return_value.get_selection.return_value = source
+        self.deps["selector"].get_source_rect.return_value = (0, 0, 640, 480)
+        self.deps["selector"].get_source_monitor_rect.return_value = (0, 0, 1920, 1080)
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.assertTrue(app.select_game())
+        self.assertFalse(app.filters_enabled)
+        self.assertFalse(app.ai_mode)
+        self.assertFalse(app.fsr_mode)
+        self.assertIsNone(app.ai_upscaler)
+        self.assertEqual(app.sharpness, 0.0)
+        self.deps["filters"].NvidiaAIUpscaler.assert_not_called()
+
+    def test_the_filters_stay_on_by_default(self):
+        source = {"source_type": "window", "hwnd": 7, "title": "Game", "mode": "bitblt",
+                  "fps": 120, "scale": "1.0", "algo": "Bicubic", "sharpness": 40,
+                  "engine_type": "Fast (DIS Flow)", "fg_enabled": False}
+        self.deps["ui"].GameSelectorUI.return_value.get_selection.return_value = source
+        self.deps["selector"].get_source_rect.return_value = (0, 0, 640, 480)
+        self.deps["selector"].get_source_monitor_rect.return_value = (0, 0, 1920, 1080)
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.assertTrue(app.select_game())
+        self.assertTrue(app.filters_enabled)
+        self.assertGreater(app.sharpness, 0)
 
 
 if __name__ == "__main__":

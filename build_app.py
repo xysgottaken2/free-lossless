@@ -49,9 +49,20 @@ hidden_imports = [
     "requests",
 ]
 
-def build():
-    print(f"Building {exe_name}...")
-    
+def build(mode="onefile"):
+    """Build the app.
+
+    ``onefile`` gives a single .exe that unpacks itself on every start (slow on a
+    ~260 MB bundle). ``onedir`` gives a folder with the executable next to its
+    DLLs, which opens in a fraction of the time. Both are built for the releases;
+    the folder version is the one to use day to day.
+    """
+    if mode == "both":
+        build("onefile")
+        build("onedir")
+        return
+    print(f"Building {exe_name} ({mode})...")
+
     # Ensure build directories are clean
     if os.path.exists("dist"):
         shutil.rmtree("dist")
@@ -61,10 +72,11 @@ def build():
     params = [
         script_name,
         "--name", exe_name,
-        "--onefile",
         "--noconsole", # GUI mode
         "--clean",
     ]
+    if mode == "onefile":
+        params.append("--onefile")
 
     # Add datas
     for src, dst in datas:
@@ -79,8 +91,18 @@ def build():
 
     # Run PyInstaller
     PyInstaller.__main__.run(params)
-    
-    print("\nBuild Complete! Executable is in the 'dist' folder.")
+
+    print(f"\nBuild Complete! ({mode})")
+    if mode == "onedir":
+        print("Portable folder: dist/FreeLossless/FreeLossless.exe (open this one for faster start)")
+    else:
+        print("Single file: dist/FreeLossless.exe")
+
 
 if __name__ == "__main__":
-    build()
+    import sys
+
+    requested = sys.argv[1].lstrip("-") if len(sys.argv) > 1 else "onefile"
+    if requested not in ("onefile", "onedir", "both"):
+        raise SystemExit("usage: python build_app.py [onefile|onedir|both]")
+    build(requested)

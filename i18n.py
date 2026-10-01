@@ -60,6 +60,21 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "Sharpest, but several times heavier than Bicubic on large screens.",
         "algo.hint.fsr": "Fast upscale with adaptive sharpening.",
         "algo.hint.ai": "Maximum quality through the neural model; requires a capable GPU.",
+        "section.filters": "EXTERNAL FILTERS (RESHADE STYLE)",
+        "field.filter_preset": "Filter preset",
+        "filter.off": "Off",
+        "filter.soft": "Soft (LumaSharpen + Vibrance)",
+        "filter.sharp": "Sharp (LumaSharpen + Clarity)",
+        "filter.vivid": "Vivid (Vibrance + Contrast)",
+        "filter.hint": ("Applied by the overlay to the final image, before the upscale: works in any "
+                        "game, windowed or fullscreen, without touching the game. Costs a few "
+                        "milliseconds per frame."),
+        "filter.reshade_found": ("ReShade found in this game ({files}): the effects you use there "
+                                 "already show up in the overlay image."),
+        "toggle.filters": "Image filters (sharpening and upscale)",
+        "toggle.filters_hint": ("Turn it off to see the raw image: no sharpening and a plain "
+                                "resize, like turning frame interpolation off."),
+        "filters.disabled": "Image filters are off in this session.",
         "toggle.interpolation": "Frame interpolation",
         "toggle.interpolation_hint": "Creates intermediate frames for more fluidity.",
         "toggle.ultra_smooth": "Ultra Smooth",
@@ -175,6 +190,21 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "Mais nítido, mas várias vezes mais pesado que o bicúbico em telas grandes.",
         "algo.hint.fsr": "Escala rápida com nitidez adaptativa.",
         "algo.hint.ai": "Qualidade máxima pelo modelo neural; exige uma GPU capaz.",
+        "section.filters": "FILTROS EXTERNOS (ESTILO RESHADE)",
+        "field.filter_preset": "Preset de filtros",
+        "filter.off": "Desligado",
+        "filter.soft": "Suave (LumaSharpen + Vibrance)",
+        "filter.sharp": "Nítido (LumaSharpen + Clarity)",
+        "filter.vivid": "Vívido (Vibrance + Contraste)",
+        "filter.hint": ("Aplicados pelo overlay na imagem final, antes do upscale: funcionam em "
+                        "qualquer jogo, em janela ou tela cheia, sem tocar no jogo. Custa alguns "
+                        "milissegundos por quadro."),
+        "filter.reshade_found": ("ReShade encontrado neste jogo ({files}): os efeitos que você usa "
+                                 "lá já aparecem na imagem do overlay."),
+        "toggle.filters": "Filtros de imagem (nitidez e upscale)",
+        "toggle.filters_hint": ("Desligue para ver a imagem crua: sem nitidez e com redimensionamento "
+                                "simples, como desligar a interpolação de quadros."),
+        "filters.disabled": "Os filtros de imagem estão desligados nesta sessão.",
         "toggle.interpolation": "Interpolação de quadros",
         "toggle.interpolation_hint": "Cria frames intermediários para mais fluidez.",
         "toggle.ultra_smooth": "Ultra Smooth",
@@ -289,6 +319,18 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "最锐利，但在大屏幕上比双三次慢数倍。",
         "algo.hint.fsr": "快速放大并带有自适应锐化。",
         "algo.hint.ai": "通过神经网络模型获得最佳质量，需要性能较强的 GPU。",
+        "section.filters": "外部滤镜（ReShade 风格）",
+        "field.filter_preset": "滤镜预设",
+        "filter.off": "关闭",
+        "filter.soft": "柔和（LumaSharpen + Vibrance）",
+        "filter.sharp": "锐利（LumaSharpen + Clarity）",
+        "filter.vivid": "鲜艳（Vibrance + 对比度）",
+        "filter.hint": ("由叠加层在放大前应用于最终画面：窗口或全屏游戏都能用，不接触游戏进程。"
+                        "每个画面约几毫秒。"),
+        "filter.reshade_found": "检测到该游戏已安装 ReShade（{files}）：你在那里使用的效果已经出现在叠加画面中。",
+        "toggle.filters": "图像滤镜（锐化与放大）",
+        "toggle.filters_hint": "关闭后显示原始画面：不锐化，仅做简单缩放，就像关闭帧插值一样。",
+        "filters.disabled": "本次会话已关闭图像滤镜。",
         "toggle.interpolation": "帧插值",
         "toggle.interpolation_hint": "生成中间帧以提升流畅度。",
         "toggle.ultra_smooth": "Ultra Smooth",

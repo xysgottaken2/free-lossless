@@ -10,6 +10,9 @@ import i18n
 
 CAPTURE_MODES = ("bitblt", "dxcam")
 SCALE_OPTIONS = ("1.0", "1.25", "1.5", "2.0", "Fullscreen")
+# Canonical preset names, kept here so the settings module never imports OpenCV.
+FILTER_PRESETS = ("Off", "Soft", "Sharp", "Vivid")
+
 ALGORITHM_OPTIONS = (
     "Bilinear", "Bicubic", "Lanczos", "FSR 1.0 / CAS (Nitidez)", "NVIDIA AI SuperRes",
 )
@@ -35,6 +38,11 @@ DEFAULT_SETTINGS = {
     "sharpness": 20,
     "frame_multiplier": 2,
     "fg_enabled": True,
+    # Post-processing filters applied by the overlay itself (see effects.py).
+    "filter_preset": "Off",
+    # Image filters (sharpening and the upscale algorithm) can be switched off to
+    # compare the raw image, exactly like frame generation can.
+    "filters_enabled": True,
     "engine_type": "AI (RIFE ONNX)",
     "ultra_smooth": False,
     "performance_mode": False,
@@ -108,6 +116,7 @@ def normalize_settings(data):
         "scale": SCALE_OPTIONS,
         "algo": ALGORITHM_OPTIONS,
         "engine_type": ENGINE_OPTIONS,
+        "filter_preset": FILTER_PRESETS,
     }
     for key, options in choices.items():
         if isinstance(data.get(key), str) and data[key] in options:
@@ -119,7 +128,8 @@ def normalize_settings(data):
             result[key] = value
     if result["frame_multiplier"] % MULTIPLIER_STEP:
         result["frame_multiplier"] = DEFAULT_SETTINGS["frame_multiplier"]
-    for key in ("fg_enabled", "ultra_smooth", "performance_mode", "low_latency", "show_fps"):
+    for key in ("fg_enabled", "filters_enabled", "ultra_smooth", "performance_mode",
+                "low_latency", "show_fps"):
         if isinstance(data.get(key), bool):
             result[key] = data[key]
     result["language"] = i18n.normalize_language(data.get("language"))

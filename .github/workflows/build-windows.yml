@@ -43,7 +43,7 @@ jobs:
           # Tests exercise every module; they must not write to a real overlay.log.
           FREE_LOSSLESS_LOG: '0'
         run: |
-          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py i18n.py theme.py splash.py diagnostics.py ort_providers.py build_app.py
+          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py effects.py i18n.py theme.py splash.py diagnostics.py ort_providers.py build_app.py
           if python -m unittest discover -s tests -v > unittest.log 2>&1; then
             cat unittest.log
           else
@@ -64,13 +64,36 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Build executable
-        run: python build_app.py
+      - name: Build single-file executable
+        run: |
+          python build_app.py onefile
+          mkdir -p release/single-file
+          cp dist/FreeLossless.exe release/single-file/
 
-      - name: Upload executable
+      - name: Build portable folder (opens much faster)
+        run: |
+          python build_app.py onedir
+          mkdir -p release/portable
+          cp -r dist/FreeLossless/. release/portable/
+
+      - name: Upload single-file executable
         uses: actions/upload-artifact@v4
         with:
           name: FreeLossless-Windows-x64
-          path: dist/FreeLossless.exe
+          path: release/single-file/FreeLossless.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload portable folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeLossless-Windows-x64-portable
+          path: release/portable
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Show what was built
+        shell: bash
+        run: |
+          echo "single file:" && ls -la release/single-file
+          echo "portable:" && du -sh release/portable && ls release/portable | head

@@ -4,8 +4,14 @@ Two problems used to show up on screen at the same time: the displayed image
 stopped whenever the frame generator could not keep up, and the status chip
 alternated between FG and LIVE on every frame, which reads as flicker.
 """
+import time
 import unittest
 from queue import Queue
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy ships in requirements.txt
+    np = None
 
 from helpers import load_module, stubs
 
@@ -127,3 +133,57 @@ class ModeChipTests(DisplayFallbackTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveRenderBudgetTests(DisplayFallbackTests):
+    """Live frames keep coming even when rendering them costs too much.
+
+    The capture thread renders them itself, so an expensive render there would hold
+    every capture back and drop the frame rate the user sees.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.app.display_dim = (1920, 1080)
+        self.app.filters_enabled = True
+        self.app.fsr_mode = False
+        self.app.ai_mode = False
+        self.app.ai_upscaler = None
+        self.app.sharpness = 1.0
+        self.app.upscale_algo = 1
+        self.app.filter_chain = None
+        self.app.live_render_ms = 0.0
+        self.app.live_render_budget_ms = 4.0
+        self.app.live_degraded = False
+        self.rendered = []
+        self.app._render_for_display = lambda frame: (self.rendered.append("full"), frame)[1]
+
+    def publish(self, frame="frame"):
+        self.app._publish_live_frame(frame)
+
+    def test_a_cheap_render_is_used_while_it_fits_the_budget(self):
+        self.publish()
+        self.assertEqual(self.rendered, ["full"])
+
+    def test_rendering_is_downgraded_once_it_is_too_expensive(self):
+        self.publish()
+        for _ in range(40):                     # the smoothed cost climbs past the budget
+            self.app._render_for_display = lambda frame: (time.sleep(0.012), frame)[1]
+            self.publish()
+        self.assertTrue(self.app.live_degraded)
+        self.assertGreater(self.app.live_render_ms, self.app.live_render_budget_ms)
+        # It stops asking for the expensive render and only resizes.
+        self.app._render_for_display = lambda frame: (self.rendered.append("full"), frame)[1]
+        before = len(self.rendered)
+        self.publish()
+        self.assertEqual(len(self.rendered), before)
+
+    def test_the_cheap_path_only_resizes(self):
+        frame = np.zeros((600, 800, 3), dtype=np.uint8)
+        self.app._cheap_render(frame)
+        # One resize straight to the display size and nothing else.
+        self.assertEqual(self.deps["cv2"].resize.call_args.args[1], (1920, 1080))
+
+    def test_a_frame_already_at_display_size_is_passed_through(self):
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.assertIs(self.app._cheap_render(frame), frame)

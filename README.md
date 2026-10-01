@@ -22,6 +22,18 @@ Unlike most frame generation tools that need to be "inside" the game (using its 
 
 ---
 
+## Build em pasta (abre bem mais rápido)
+
+O artifact do CI traz **duas versões**:
+
+- `FreeLossless-Windows-x64` — o `.exe` único, prático de copiar.
+- `FreeLossless-Windows-x64-portable` — a versão em pasta (`FreeLossless/FreeLossless.exe`
+  ao lado das DLLs). **Use esta no dia a dia**: um `.exe` único de ~260 MB se
+  descompacta toda vez que abre, o que adiciona segundos ao boot.
+
+Para gerar localmente: `python build_app.py onefile`, `python build_app.py onedir` ou
+`python build_app.py both`.
+
 ## Download the Windows app (no local build needed)
 
 GitHub Actions builds a standalone Windows x64 executable on every push and pull
@@ -142,6 +154,12 @@ Além disso:
 - A imagem **nunca para**: quando não há frame gerado pronto, o overlay mostra a
   captura mais recente já preparada (mesma nitidez e mesmo upscale), então a troca de
   fonte não muda o visual do quadro.
+- As **imagens ao vivo** (modo LIVE) são renderizadas na thread de captura; se essa
+  renderização custar mais que meio intervalo de quadro, ela cai para o caminho simples
+  (um resize) — melhor uma imagem levemente mais suave em 120 FPS do que uma nítida a
+  30 FPS.
+- O worker de pós-processamento **espera na fila** em vez de fazer polling a cada 20 ms,
+  e a captura dorme até o próximo quadro em vez de acordar a cada 1 ms.
 - O chip de status não pisca: ele só marca `LIVE` depois de um atraso contínuo de
   meio segundo e só volta para `FG` depois de outro meio segundo de frames gerados. O
   chip também mostra a taxa real de geração (por exemplo, `FG 118/s`).
@@ -149,6 +167,10 @@ Além disso:
   não acompanhar, o número cai em vez de mentir.
 - O processo do overlay roda com prioridade alta; o worker de interpolação roda com
   prioridade **abaixo do normal**, para nunca competir com o jogo nem com a exibição.
+- Os filtros externos (nitidez/upscale) têm um **interruptor próprio** no menu, como a
+  interpolação de quadros: desligado, os frames vão para a tela sem nitidez, sem FSR e
+  sem upscale por IA, só com um redimensionamento simples — e o modelo de IA nem é
+  carregado.
 - Motor de IA sem GPU (RIFE na CPU) leva segundos por frame: o worker detecta e troca
   para o motor rápido (DIS Flow) na mesma sessão, em vez de travar o overlay.
 - Com DirectML o RIFE roda na GPU: escolha **AI (RIFE ONNX)** para a melhor qualidade de
@@ -173,6 +195,47 @@ upscale de IA leva centenas de milissegundos; para o overlay nunca virar um slid
   placeholder inválido, então o filtro não fazia nada.
 - A conversão **YCbCr** usada no treino do modelo está embutida no grafo ONNX: o app
   entrega RGB e a conversão roda na GPU, sem custo na CPU.
+
+## Filtros externos (estilo ReShade)
+
+O ReShade se instala **dentro do jogo** (ele se injeta no executável para hookar o
+DirectX), então não existe como "instalar o ReShade no app": quem precisa do ReShade é
+o jogo, e é justamente isso que anti-cheats bloqueiam. O overlay, por outro lado, é uma
+janela separada que captura a imagem final do jogo — então ele aplica os filtros na
+imagem que já é dele, sem tocar no jogo. Resultado: filtros funcionam em **qualquer**
+jogo, com ou sem anti-cheat, em janela ou tela cheia.
+
+Presets (menu → **FILTROS EXTERNOS**), aplicados na resolução interna antes do upscale:
+
+| Preset | Efeitos (equivalentes do ReShade) |
+| --- | --- |
+| Desligado | nada |
+| Suave | LumaSharpen (clamp 16) + Vibrance |
+| Nítido | LumaSharpen (clamp 24) + Clarity |
+| Vívido | Vibrance + Contraste (curva S) |
+
+- **LumaSharpen**: nitidez só onde há detalhe de luma, com *clamp* para não criar halos.
+- **Vibrance**: aumenta a saturação das cores apagadas e preserva as já saturadas.
+- **Clarity**: contraste local de raio largo.
+- **Contraste**: curva S suave por tabela de consulta (preto e branco fixos).
+
+Além disso, quando o jogo selecionado já tem ReShade instalado, o menu mostra
+`ReShade encontrado neste jogo (...)` — útil para não duplicar o mesmo look: como
+capturamos a imagem final, os efeitos do ReShade já aparecem no overlay.
+
+Custo medido nesta máquina de teste (2 núcleos, 800 × 600): Desligado 0 ms · Nítido
+~7 ms · Vívido ~6 ms · Suave ~10 ms por quadro. O custo do preset escolhido é medido e
+registrado no log na abertura do overlay, com aviso quando passa de um intervalo de
+quadro.
+
+## Janela do overlay (click-through)
+
+O overlay fica sempre no topo, **sem receber cliques** (`WS_EX_TRANSPARENT`) e
+**sem roubar foco** (`WS_EX_NOACTIVATE`), além de excluído de capturas de tela
+(`WDA_EXCLUDEFROMCAPTURE`). O Windows reaplica estilos quando a janela é recriada e
+pode devolver o foco ao overlay depois da tecla Windows ou de um Alt+Tab — por isso os
+estilos são reafirmados a cada mudança de geometria e a cada meio segundo, o que
+resolve o caso em que o overlay "saía" e dava para arrastá-lo.
 
 ### Diagnóstico
 

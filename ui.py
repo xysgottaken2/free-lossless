@@ -2,10 +2,11 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+import effects
 import i18n
 from selector import WindowSelector, DisplaySelector
 from settings import (
-    ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, ENGINE_OPTIONS,
+    ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, ENGINE_OPTIONS, FILTER_PRESETS,
     HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
     MULTIPLIER_MIN, MULTIPLIER_STEP, SCALE_OPTIONS, SettingsStore,
     hotkey_conflicts, normalize_settings, source_identity,
@@ -26,6 +27,12 @@ ALGORITHM_HINT_KEYS = {
     "FSR 1.0 / CAS (Nitidez)": "algo.hint.fsr",
     "NVIDIA AI SuperRes": "algo.hint.ai",
 }
+FILTER_LABEL_KEYS = {
+    "Off": "filter.off",
+    "Soft": "filter.soft",
+    "Sharp": "filter.sharp",
+    "Vivid": "filter.vivid",
+}
 ALGORITHM_LABEL_KEYS = {
     "Bilinear": "algo.bilinear",
     "Bicubic": "algo.bicubic",
@@ -42,7 +49,8 @@ class GameSelectorUI:
     SETTING_VARIABLES = {
         "source_type": "source_var", "mode": "mode_var", "fps": "fps_var",
         "scale": "scale_var", "algo": "algo_var", "sharpness": "sharp_var",
-        "fg_enabled": "fg_var", "engine_type": "engine_var",
+        "fg_enabled": "fg_var", "filters_enabled": "filters_var", "engine_type": "engine_var",
+        "filter_preset": "filter_var",
         "ultra_smooth": "ultra_smooth_var", "performance_mode": "perf_mode_var",
         "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
         "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
@@ -417,15 +425,35 @@ class GameSelectorUI:
         self.algo_hint_label = self._label(image, textvariable=self.algo_hint_var, muted=True,
                                            size=9, justify=tk.LEFT)
         self.algo_hint_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.filters_check = self._toggle_row(image, 4, _t("toggle.filters"),
+                                              _t("toggle.filters_hint"), self.filters_var)
+        self.filters_hint_var = tk.StringVar(self.root)
+        self.filters_hint_label = self._label(image, textvariable=self.filters_hint_var, muted=True,
+                                               size=9, justify=tk.LEFT)
+        self.filters_hint_label.grid(row=5, column=0, sticky="w", pady=(0, 4))
         sharp_line = tk.Frame(image, bg=COLORS["panel"])
-        sharp_line.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        sharp_line.grid(row=6, column=0, sticky="ew", pady=(6, 0))
         sharp_line.columnconfigure(0, weight=1)
         self._label(sharp_line, _t("field.sharpness"), bold=True).grid(row=0, column=0, sticky="w")
         self._label(sharp_line, textvariable=self.sharp_value_var, bold=True).grid(row=0, column=1, sticky="e")
         self.sharp_scale = self._slider(image, self.sharp_var, 0, 100)
-        self.sharp_scale.grid(row=5, column=0, sticky="ew", pady=(6, 8))
+        self.sharp_scale.grid(row=7, column=0, sticky="ew", pady=(6, 8))
 
-        generation = self._section(parent, _t("section.frame_generation"), 2)
+        filters = self._section(parent, _t("section.filters"), 2)
+        self._label(filters, _t("field.filter_preset"), size=9).grid(row=1, column=0, sticky="w",
+                                                                     pady=(0, 6))
+        filter_labels = {value: _t(FILTER_LABEL_KEYS[value]) for value in FILTER_PRESETS}
+        self.filter_combo = self._linked_combo(filters, self.filter_var, filter_labels)
+        self.filter_combo.grid(row=2, column=0, sticky="ew")
+        self.filter_hint_var = tk.StringVar(self.root)
+        self._label(filters, textvariable=self.filter_hint_var, muted=True, size=9,
+                    justify=tk.LEFT).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.reshade_hint_var = tk.StringVar(self.root)
+        self.reshade_hint_label = self._label(filters, textvariable=self.reshade_hint_var,
+                                              muted=True, size=9, justify=tk.LEFT)
+        self.reshade_hint_label.grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+        generation = self._section(parent, _t("section.frame_generation"), 3)
         self.fg_check = self._toggle_row(generation, 1, _t("toggle.interpolation"),
                                         _t("toggle.interpolation_hint"), self.fg_var)
         engine_labels = {value: _t(ENGINE_LABEL_KEYS[value]) for value in ENGINE_OPTIONS}
@@ -445,7 +473,7 @@ class GameSelectorUI:
         self.multiplier_hint_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
         generation.bind("<Configure>", lambda event: self.multiplier_hint_label.config(
             wraplength=max(200, event.width - 24)))
-        advanced = self._section(parent, _t("section.advanced"), 3)
+        advanced = self._section(parent, _t("section.advanced"), 4)
         self.ultra_smooth_check = self._toggle_row(advanced, 1, _t("toggle.ultra_smooth"),
                                                    _t("toggle.ultra_smooth_hint"), self.ultra_smooth_var)
         self.perf_mode_check = self._toggle_row(advanced, 2, _t("toggle.performance"),
@@ -732,6 +760,28 @@ class GameSelectorUI:
                 detail = f"{right - left} × {bottom - top}  ·  {_t('source.full_monitor')}"
             self.selected_detail_var.set(detail)
 
+    def _refresh_reshade_hint(self):
+        """Tell the user when the selected game already runs ReShade.
+
+        Nothing is installed or injected: the overlay captures the game's final image,
+        so whatever ReShade is doing in there already reaches this preview. Knowing it
+        avoids trying to stack the same look twice.
+        """
+        source = self.selected_source or {}
+        process = source.get("process") if source.get("source_type") == "window" else None
+        if not process:
+            self.reshade_hint_var.set("")
+            return
+        try:
+            _directory, files = effects.reshade_installed(process)
+        except Exception:
+            files = []
+        if files:
+            self.reshade_hint_var.set(_t("filter.reshade_found", files=", ".join(sorted(files)[:3])))
+            self.reshade_hint_label.config(fg=COLORS["success"])
+        else:
+            self.reshade_hint_var.set("")
+
     def _update_setting_display(self):
         fps = self.fps_var.get()
         multiplier = self.multiplier_var.get()
@@ -744,7 +794,14 @@ class GameSelectorUI:
         self.engine_combo.configure(state="readonly" if generation_on else "disabled")
         self.multiplier_scale.configure(state=tk.NORMAL if generation_on else tk.DISABLED)
         self._sync_choice_displays()
+        filters_on = bool(self.filters_var.get())
+        self.algo_combo.configure(state="readonly" if filters_on else "disabled")
+        self.sharp_scale.configure(state=tk.NORMAL if filters_on else tk.DISABLED)
+        self.filters_hint_var.set("" if filters_on else _t("filters.disabled"))
+        self.filters_hint_label.config(fg=COLORS["warning"])
+        self.filter_combo.configure(state="readonly" if filters_on else "disabled")
         self.algo_hint_var.set(_t(ALGORITHM_HINT_KEYS.get(self.algo_var.get(), "algo.hint.bicubic")))
+        self.filter_hint_var.set(_t("filter.hint"))
         if not generation_on:
             hint = _t("multiply.disabled")
             tone = "muted"
@@ -772,6 +829,7 @@ class GameSelectorUI:
             return
         self._remember_selected_source()
         self._update_source_display()
+        self._refresh_reshade_hint()
         self._schedule_save()
 
     def _collect_settings(self):
