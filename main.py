@@ -17,6 +17,29 @@ import win32con
 import win32api
 import os
 
+HUD_COLORS = {
+    "accent": (118, 149, 255),
+    "on": (105, 221, 178),
+    "off": (150, 162, 178),
+    "mode": (240, 188, 120),
+    "muted": (154, 170, 192),
+    "panel": (9, 14, 24, 200),
+    "border": (44, 60, 84),
+}
+HUD_PADDING = 12
+HUD_GAP = 8
+HUD_CHIP_PADDING = 16
+
+
+def hud_chips(fsr_on, ai_on, ultra_smooth):
+    """Status chips for the overlay panel, as (label, value, color key)."""
+    return [
+        ("FSR", "ON" if fsr_on else "OFF", "on" if fsr_on else "off"),
+        ("AI", "ON" if ai_on else "OFF", "on" if ai_on else "off"),
+        ("MODO", "SMOOTH" if ultra_smooth else "PADRÃO", "mode" if ultra_smooth else "off"),
+    ]
+
+
 def processing_subroutine(capture_queue, process_queue, engine_config, stop_event):
     """
     Standalone subroutine for multiprocessing.
@@ -255,6 +278,62 @@ class FrameGenerationApp:
         print("Press F11 to stop, F10 to toggle FPS.")
         return True
 
+    def _hud_parts(self, font, small_font):
+        """Render the panel once per status change, not once per displayed frame."""
+        key = (round(self.current_fps), self.fsr_mode, self.ai_mode, self.ultra_smooth)
+        cached = getattr(self, "_hud_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        fps_value = font.render(f"{round(self.current_fps)}", True, HUD_COLORS["accent"])
+        fps_label = small_font.render("FPS", True, HUD_COLORS["muted"])
+        hint = small_font.render("F11  menu", True, HUD_COLORS["muted"])
+        chips = []
+        for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth):
+            color = HUD_COLORS[state]
+            text = small_font.render(f"{label} {value}", True, color)
+            chips.append((color, text))
+
+        chip_widths = [text.get_width() + HUD_CHIP_PADDING for _, text in chips]
+        chip_height = max([text.get_height() for _, text in chips] + [0]) + HUD_GAP
+        chip_backgrounds = []
+        for (color, _), width in zip(chips, chip_widths):
+            background = pygame.Surface((width, chip_height), pygame.SRCALPHA)
+            background.fill((*color, 40))
+            chip_backgrounds.append(background)
+        fps_row = fps_value.get_width() + HUD_GAP + fps_label.get_width()
+        chip_row = sum(chip_widths) + HUD_GAP * max(0, len(chips) - 1)
+        content_width = max(fps_row, chip_row, hint.get_width())
+        content_height = fps_value.get_height() + HUD_GAP + chip_height + HUD_GAP + hint.get_height()
+        panel = pygame.Surface((content_width + HUD_PADDING * 2, content_height + HUD_PADDING * 2),
+                               pygame.SRCALPHA)
+        panel.fill(HUD_COLORS["panel"])
+        parts = (panel, fps_value, fps_label, hint, chips, chip_widths, chip_height, chip_backgrounds)
+        self._hud_cache = (key, parts)
+        return parts
+
+    def _draw_hud(self, screen, font, small_font):
+        """Rounded translucent status panel: FPS, state chips and the F11 hint."""
+        (panel, fps_value, fps_label, hint,
+         chips, chip_widths, chip_height, chip_backgrounds) = self._hud_parts(font, small_font)
+        panel_width, panel_height = panel.get_width(), panel.get_height()
+        screen.blit(panel, (16, 16))
+        pygame.draw.rect(screen, HUD_COLORS["border"], (16, 16, panel_width, panel_height),
+                         width=1, border_radius=12)
+
+        x = 16 + HUD_PADDING
+        y = 16 + HUD_PADDING
+        screen.blit(fps_value, (x, y))
+        screen.blit(fps_label, (x + fps_value.get_width() + HUD_GAP,
+                                y + fps_value.get_height() - fps_label.get_height()))
+        y += fps_value.get_height() + HUD_GAP
+        for (chip_color, text), width, background in zip(chips, chip_widths, chip_backgrounds):
+            screen.blit(background, (x, y))
+            pygame.draw.rect(screen, chip_color, (x, y, width, chip_height), width=1, border_radius=8)
+            screen.blit(text, (x + HUD_CHIP_PADDING // 2, y + (chip_height - text.get_height()) // 2))
+            x += width + HUD_GAP
+        y += chip_height + HUD_GAP
+        screen.blit(hint, (16 + HUD_PADDING, y))
+
     def run(self):
         if not self.select_game():
             return False
@@ -279,6 +358,7 @@ class FrameGenerationApp:
         # FPS Font
         pygame.font.init()
         font = pygame.font.SysFont("Arial", 24, bold=True)
+        small_font = pygame.font.SysFont("Arial", 18, bold=True)
         
         hwnd_pygame = pygame.display.get_wm_info()["window"]
         
@@ -420,26 +500,12 @@ class FrameGenerationApp:
                             print(f"FSR Mode: {'ON' if self.fsr_mode else 'OFF'}")
                     
                     if self.show_fps:
-                        status_color = (0, 255, 0)
-                        fps_text = font.render(f"FPS: {self.current_fps:.1f}", True, status_color)
-                        fsr_text = font.render(f"(F9) FSR: {'ON' if self.fsr_mode else 'OFF'}", True, (255, 200, 0) if self.fsr_mode else (150, 150, 150))
-                        
-                        ai_text = font.render(f"AI SuperRes: {'ON' if self.ai_mode else 'OFF'}", True, (0, 255, 200) if self.ai_mode else (150, 150, 150))
-
-                        # Extra status for new modes
-                        mode_text_str = "STD"
-                        if self.ultra_smooth: mode_text_str = "SMOOTH"
-                        mode_text = font.render(f"Mode: {mode_text_str}", True, (0, 200, 255))
-
-                        # Draw status box
-                        bg_rect = pygame.Rect(10, 10, 200, 110)
-                        pygame.draw.rect(screen, (0, 0, 0), bg_rect)
-                        pygame.draw.rect(screen, (50, 50, 50), bg_rect, 2)
-                        
-                        screen.blit(fps_text, (20, 15))
-                        screen.blit(fsr_text, (20, 40))
-                        screen.blit(ai_text, (20, 65))
-                        screen.blit(mode_text, (20, 90))
+                        # Cosmetic only: a drawing problem must never stop the overlay.
+                        try:
+                            self._draw_hud(screen, font, small_font)
+                        except Exception as exc:
+                            print(f"Status panel disabled: {exc}")
+                            self.show_fps = False
 
                     pygame.display.flip()
                     

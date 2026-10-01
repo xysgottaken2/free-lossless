@@ -55,6 +55,9 @@ O menu usa um tema escuro, com painéis separados para a fonte de captura e os
 ajustes do overlay. Há atalhos de FPS, controles de ativação e uma área de ajustes
 com rolagem para manter todas as opções acessíveis em telas menores.
 
+- O painel de status do overlay (tecla **F10**) também foi modernizado: FPS em
+  destaque, etiquetas de estado para FSR, AI e modo, e a dica de **F11**. O conteúdo
+  é renderizado apenas quando o status muda, para não pesar no frame.
 - As alterações são salvas automaticamente após uma breve pausa nos ajustes.
 - **Iniciar overlay**, **Sair** e o botão de fechar a janela salvam imediatamente,
   sem precisar de um botão de confirmação.
