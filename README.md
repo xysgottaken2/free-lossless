@@ -42,12 +42,41 @@ unsigned, so Windows SmartScreen may show a warning; only run builds you trust.
 - **Display/Monitor**: select an entire monitor, such as **Display 1** or
   **Display 2**. The actual primary monitor is marked **Monitor principal**; display
   numbers follow Windows and the primary monitor is not necessarily Display 1.
-- Use **Refresh List** after opening a window or connecting/disconnecting a monitor.
+- Use **Atualizar** after opening a window or connecting/disconnecting a monitor.
 - **Backend de captura** still selects DXCAM or BitBlt; it is independent of the
   capture source. DXCAM falls back to BitBlt if an output is unavailable or a window
   spans monitors.
 - **Fullscreen** puts a borderless overlay on the selected source's monitor,
   rather than always using the primary screen. Press **F11** to return to the menu.
+
+## Interface e salvamento automático
+
+O menu usa um tema escuro, com painéis separados para a fonte de captura e os
+ajustes do overlay. Há atalhos de FPS, controles de ativação e uma área de ajustes
+com rolagem para manter todas as opções acessíveis em telas menores.
+
+- As alterações são salvas automaticamente após uma breve pausa nos ajustes.
+- **Iniciar overlay**, **Sair** e o botão de fechar a janela salvam imediatamente,
+  sem precisar de um botão de confirmação.
+- Ao voltar com **F11** ou reabrir o app, são restaurados o tipo de fonte, backend,
+  FPS, escala, algoritmo, nitidez, geração de quadros, motor, Ultra Smooth, modo de
+  desempenho e baixa latência.
+- A última janela e o último monitor selecionados também são lembrados. A seleção
+  só é restaurada quando a fonte está disponível: monitores são identificados pelo
+  dispositivo e janelas pelo título/processo. Se o título mudar, o processo só é
+  usado quando há uma única janela correspondente. Identificadores de janelas
+  (`HWND`) e posições antigas de monitores **não** são reutilizados.
+
+No Windows, as preferências ficam em
+`%LOCALAPPDATA%\FreeLossless\settings.json` (com `%APPDATA%` como alternativa),
+independentemente da pasta do executável. Em outros sistemas, o módulo de
+preferências respeita `$XDG_CONFIG_HOME/free-lossless/settings.json` ou
+`~/.config/free-lossless/settings.json`; a captura e o overlay continuam exclusivos
+para Windows.
+
+A gravação é atômica para preservar o último arquivo em caso de falha. Se o arquivo
+estiver inválido ou ilegível, o menu abre com os padrões e mostra um aviso no status.
+Se não for possível salvar, o app informa o erro em vez de fechar inesperadamente.
 
 ## Setup Guide (developers / running from source)
 

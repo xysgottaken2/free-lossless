@@ -34,7 +34,7 @@ jobs:
 
       - name: Check syntax and run tests
         run: |
-          python -m compileall -q main.py ui.py selector.py capture.py engine.py filters.py build_app.py
+          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py build_app.py
           python -m unittest discover -s tests -v
 
       - name: Build executable
