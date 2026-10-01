@@ -5,6 +5,19 @@ from helpers import load_module, stubs
 from settings import normalize_settings
 
 
+class FakeVar:
+    """Minimal stand-in for a tkinter variable."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
 class SelectionUITests(unittest.TestCase):
     def setUp(self):
         self.deps = stubs("tkinter", "tkinter.ttk", "tkinter.messagebox", "selector")
@@ -24,18 +37,21 @@ class SelectionUITests(unittest.TestCase):
         self.ui._closing = False
         self.ui._loading_settings = False
         self.ui._last_saved_settings = normalize_settings(None)
-        settings = {
-            "source_type": "window", "mode": "dxcam", "fps": 90, "scale": "Fullscreen", "algo": "Lanczos",
-            "sharpness": 20, "fg_enabled": True, "engine_type": "Fast (DIS Flow)", "ultra_smooth": False,
-            "performance_mode": False, "low_latency": True,
-        }
+        # Start from the real defaults so new preferences cannot break this suite.
+        settings = {**normalize_settings(None), "mode": "dxcam", "fps": 90, "scale": "Fullscreen",
+                    "engine_type": "Fast (DIS Flow)"}
         for key, name in self.ui.SETTING_VARIABLES.items():
-            variable = MagicMock()
-            variable.get.return_value = settings[key]
-            setattr(self.ui, name, variable)
+            setattr(self.ui, name, FakeVar(settings[key]))
+        for name in ("multiplier_value_var", "multiplier_hint_var", "shortcuts_hint_var", "dialog_error_var"):
+            setattr(self.ui, name, MagicMock())
+        self.ui.multiplier_hint_label = MagicMock()
+        self.ui.multiplier_scale = MagicMock()
+        self.ui.dialog_error_label = MagicMock()
+        self.ui._settings_dialog = None
+        self.ui.root.winfo_exists.return_value = True
 
     def test_switch_to_display_clears_stale_sources_and_preserves_settings(self):
-        self.ui.source_var.get.return_value = "display"
+        self.ui.source_var.value = "display"
         source = {"source_type": "display", "device": r"\\.\DISPLAY2", "title": "Display 2",
                   "rect": (-1920, 0, 0, 1080)}
         self.deps["selector"].DisplaySelector.get_displays.return_value = [source]
@@ -148,7 +164,7 @@ class SelectionUITests(unittest.TestCase):
         self.assertIsNone(self.ui._find_remembered_source())
 
     def test_missing_source_leaves_preferences_intact_and_start_disabled(self):
-        self.ui.source_var.get.return_value = "display"
+        self.ui.source_var.value = "display"
         self.ui.preferred_sources = {"display": {"device": r"\\.\DISPLAY2"}}
         self.deps["selector"].DisplaySelector.get_displays.return_value = []
         self.ui._refresh_list()
@@ -158,7 +174,7 @@ class SelectionUITests(unittest.TestCase):
         self.ui.empty_label.place.assert_called_once()
 
     def test_disabling_generation_disables_engine_without_resetting_preference(self):
-        self.ui.fg_var.get.return_value = False
+        self.ui.fg_var.value = False
         self.ui._update_setting_display()
         self.ui.engine_combo.configure.assert_called_with(state="disabled")
         self.assertEqual(self.ui._collect_settings()["engine_type"], "Fast (DIS Flow)")
@@ -175,6 +191,84 @@ class SelectionUITests(unittest.TestCase):
         self.ui._autosave()
         saved = self.ui.settings_store.save.call_args.args[0]
         self.assertEqual(saved["preferred_sources"]["window"], {"title": "Game", "process": "game.exe"})
+
+    def test_multiplier_slider_shows_the_selected_factor_and_cadence(self):
+        self.ui.multiplier_var.value = 6
+        self.ui._update_setting_display()
+        self.ui.multiplier_value_var.set.assert_called_with("x6")
+        hint = self.ui.multiplier_hint_var.set.call_args.args[0]
+        self.assertIn("5 frame(s) extra(s)", hint)
+        self.assertIn("captura a 15 FPS", hint)
+        self.assertIn("saída a 90 FPS", hint)
+        self.ui.multiplier_hint_label.config.assert_called_with(fg=self.module.COLORS["muted"])
+
+    def test_high_multipliers_warn_about_the_cost(self):
+        self.ui.multiplier_var.value = 20
+        self.ui._update_setting_display()
+        hint = self.ui.multiplier_hint_var.set.call_args.args[0]
+        self.assertIn("19 frame(s) extra(s)", hint)
+        self.assertIn("captura a 4 FPS", hint)
+        self.assertIn("GPU", hint)
+        self.ui.multiplier_hint_label.config.assert_called_with(fg=self.module.COLORS["warning"])
+
+    def test_generation_settings_are_disabled_without_interpolation(self):
+        self.ui.fg_var.value = False
+        self.ui._update_setting_display()
+        self.ui.multiplier_scale.configure.assert_called_with(state=self.module.tk.DISABLED)
+        self.assertIn("Ative a interpolação", self.ui.multiplier_hint_var.set.call_args.args[0])
+        self.ui.fg_var.value = True
+        self.ui._update_setting_display()
+        self.ui.multiplier_scale.configure.assert_called_with(state=self.module.tk.NORMAL)
+
+    def test_summary_and_shortcuts_follow_the_multiplication_and_hotkeys(self):
+        self.ui.multiplier_var.value = 4
+        self.ui.hotkey_stop_var.value = "F2"
+        self.ui.hotkey_fps_var.value = "F3"
+        self.ui.hotkey_fsr_var.value = "F4"
+        self.ui._update_setting_display()
+        self.assertIn("x4 interpolação", self.ui.session_summary_var.set.call_args.args[0])
+        self.assertEqual(self.ui.shortcuts_hint_var.set.call_args.args[0],
+                         "F2 menu  ·  F3 FPS  ·  F4 FSR  ·  Ctrl + Enter inicia o overlay")
+
+    def make_dialog_vars(self, stop="F11", fps="F10", fsr="F9", show_fps=True):
+        return {"hotkey_stop": FakeVar(stop), "hotkey_fps": FakeVar(fps),
+                "hotkey_fsr": FakeVar(fsr), "show_fps": FakeVar(show_fps)}
+
+    def test_dialog_hotkey_validation_flags_repeated_keys(self):
+        self.assertTrue(self.ui._validate_dialog_hotkeys(self.make_dialog_vars()))
+        self.assertIn("diferente", self.ui.dialog_error_var.set.call_args.args[0])
+        self.assertFalse(self.ui._validate_dialog_hotkeys(self.make_dialog_vars(fsr="F11")))
+        message = self.ui.dialog_error_var.set.call_args.args[0]
+        self.assertIn("tecla diferente", message)
+        self.ui.dialog_error_label.config.assert_called_with(fg=self.module.COLORS["warning"])
+
+    def test_applying_the_dialog_updates_settings_saves_and_closes(self):
+        self.ui._close_settings_dialog = MagicMock()
+        self.ui._save_settings = MagicMock(return_value=True)
+        self.ui._apply_dialog_settings(self.make_dialog_vars(stop="F1", fps="F2", fsr="F3", show_fps=False))
+        self.assertEqual(self.ui.hotkey_stop_var.value, "F1")
+        self.assertEqual(self.ui.hotkey_fps_var.value, "F2")
+        self.assertEqual(self.ui.hotkey_fsr_var.value, "F3")
+        self.assertFalse(self.ui.show_fps_var.value)
+        self.ui._close_settings_dialog.assert_called_once()
+        self.ui._save_settings.assert_called_once_with(notify=True)
+
+    def test_applying_the_dialog_refuses_duplicate_keys(self):
+        self.ui._close_settings_dialog = MagicMock()
+        self.ui._save_settings = MagicMock(return_value=True)
+        self.ui._apply_dialog_settings(self.make_dialog_vars(fps="F11"))
+        self.ui._close_settings_dialog.assert_not_called()
+        self.ui._save_settings.assert_not_called()
+        self.assertEqual(self.ui.hotkey_fps_var.value, "F10")
+        self.module.messagebox.showwarning.assert_called_once()
+
+    def test_reset_restores_hotkeys_and_overlay_defaults_in_the_dialog(self):
+        variables = self.make_dialog_vars(stop="F1", fps="F2", fsr="F3", show_fps=False)
+        self.ui._reset_dialog(variables)
+        self.assertEqual(variables["hotkey_stop"].value, "F11")
+        self.assertEqual(variables["hotkey_fps"].value, "F10")
+        self.assertEqual(variables["hotkey_fsr"].value, "F9")
+        self.assertTrue(variables["show_fps"].value)
 
     def test_keyboard_focus_scrolls_hidden_advanced_controls_into_view(self):
         self.ui._ui_scale = 1.0
@@ -202,11 +296,11 @@ class SelectionUITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
             self.ui.settings_store = SettingsStore(path)
-            self.ui.sharp_var.get.return_value = 0
-            self.ui.fg_var.get.return_value = False
-            self.ui.low_latency_var.get.return_value = False
-            self.ui.ultra_smooth_var.get.return_value = True
-            self.ui.perf_mode_var.get.return_value = True
+            self.ui.sharp_var.value = 0
+            self.ui.fg_var.value = False
+            self.ui.low_latency_var.value = False
+            self.ui.ultra_smooth_var.value = True
+            self.ui.perf_mode_var.value = True
             self.ui._on_close()
             self.assertEqual(SettingsStore(path).load(), self.ui._collect_settings())
             self.assertEqual(SettingsStore(path).load()["sharpness"], 0)

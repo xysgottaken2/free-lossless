@@ -62,6 +62,7 @@ class OverlayHudTests(unittest.TestCase):
         app.fsr_mode = state.get("fsr_mode", False)
         app.ai_mode = state.get("ai_mode", True)
         app.ultra_smooth = state.get("ultra_smooth", False)
+        app.hotkey_names = dict(self.module.DEFAULT_HOTKEY_NAMES)
         return app
 
     def draw_hud(self, app, size=(640, 360)):
@@ -124,6 +125,13 @@ class OverlayHudTests(unittest.TestCase):
         app.fsr_mode = True
         app._draw_hud(screen, font, small_font)
         self.assertIn("FSR ON", small_font.rendered)
+
+    def test_hint_uses_the_configured_stop_key(self):
+        app = self.make_app()
+        app.hotkey_names = {"stop": "F4", "fps": "F6", "fsr": "F8"}
+        small_font = FakeFont()
+        app._draw_hud(FakeSurface((640, 360)), FakeFont(), small_font)
+        self.assertIn("F4  menu", small_font.rendered)
 
     def test_hud_errors_are_contained_by_the_caller(self):
         # The overlay loop disables the panel instead of crashing when drawing fails.

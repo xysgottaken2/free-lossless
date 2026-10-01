@@ -55,15 +55,26 @@ O menu usa um tema escuro, com painéis separados para a fonte de captura e os
 ajustes do overlay. Há atalhos de FPS, controles de ativação e uma área de ajustes
 com rolagem para manter todas as opções acessíveis em telas menores.
 
-- O painel de status do overlay (tecla **F10**) também foi modernizado: FPS em
-  destaque, etiquetas de estado para FSR, AI e modo, e a dica de **F11**. O conteúdo
-  é renderizado apenas quando o status muda, para não pesar no frame.
+- O painel de status do overlay (atalho de FPS) também foi modernizado: FPS em
+  destaque, etiquetas de estado para FSR, AI e modo, e a dica do atalho de parada. O
+  conteúdo é renderizado apenas quando o status muda, para não pesar no frame.
+- **Geração de frames (x2 a x20)**: o slider define quantos frames cada par capturado
+  se torna — x2 (padrão) gera 1 frame intermediário por par, x4 gera 3, x6 gera 5 e
+  assim por diante. A captura passa a trabalhar a `FPS ÷ multiplicador` para manter a
+  saída no FPS escolhido (o menu mostra essa taxa), e o valor aparece no rodapé.
+  Valores altos pesam mais; acima de x8 o menu avisa. Com a interpolação desligada a
+  captura volta à taxa cheia.
+- **Botão Configurações**: abre um diálogo para trocar a tecla de cada atalho global
+  (parar o overlay, contador de FPS e FSR/nitidez), escolher se o contador de FPS
+  aparece ao iniciar, abrir a pasta das preferências e restaurar os padrões. Teclas
+  repetidas são recusadas com um aviso, e **Cancelar**/**Esc** descarta as mudanças.
 - As alterações são salvas automaticamente após uma breve pausa nos ajustes.
 - **Iniciar overlay**, **Sair** e o botão de fechar a janela salvam imediatamente,
   sem precisar de um botão de confirmação.
-- Ao voltar com **F11** ou reabrir o app, são restaurados o tipo de fonte, backend,
-  FPS, escala, algoritmo, nitidez, geração de quadros, motor, Ultra Smooth, modo de
-  desempenho e baixa latência.
+- Ao voltar ao menu (atalho de parada) ou reabrir o app, são restaurados o tipo de
+  fonte, backend, FPS, escala, algoritmo, nitidez, multiplicador da geração de
+  quadros, motor, Ultra Smooth, modo de desempenho, baixa latência, atalhos e a
+  preferência do contador de FPS.
 - A última janela e o último monitor selecionados também são lembrados. A seleção
   só é restaurada quando a fonte está disponível: monitores são identificados pelo
   dispositivo e janelas pelo título/processo. Se o título mudar, o processo só é

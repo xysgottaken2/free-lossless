@@ -12,6 +12,18 @@ ALGORITHM_OPTIONS = (
     "Bilinear", "Bicubic", "Lanczos", "FSR 1.0 / CAS (Nitidez)", "NVIDIA AI SuperRes",
 )
 ENGINE_OPTIONS = ("AI (RIFE ONNX)", "Fast (DIS Flow)")
+# Multiplier 2 doubles the source rate; the slider only offers even values.
+MULTIPLIER_MIN = 2
+MULTIPLIER_MAX = 20
+MULTIPLIER_STEP = 2
+HOTKEY_OPTIONS = tuple(f"F{number}" for number in range(1, 13))
+HOTKEY_SETTING_KEYS = ("hotkey_stop", "hotkey_fps", "hotkey_fsr")
+HOTKEY_LABELS = {
+    "hotkey_stop": "Parar o overlay (voltar ao menu)",
+    "hotkey_fps": "Mostrar / ocultar o contador de FPS",
+    "hotkey_fsr": "Alternar FSR / nitidez",
+}
+DEFAULT_HOTKEYS = {"hotkey_stop": "F11", "hotkey_fps": "F10", "hotkey_fsr": "F9"}
 DEFAULT_SETTINGS = {
     "version": 1,
     "source_type": "window",
@@ -20,11 +32,14 @@ DEFAULT_SETTINGS = {
     "scale": "1.0",
     "algo": "Lanczos",
     "sharpness": 20,
+    "frame_multiplier": 2,
     "fg_enabled": True,
     "engine_type": "AI (RIFE ONNX)",
     "ultra_smooth": False,
     "performance_mode": False,
     "low_latency": True,
+    "show_fps": True,
+    **DEFAULT_HOTKEYS,
     "preferred_sources": {},
 }
 
@@ -54,6 +69,33 @@ def source_identity(source):
     return identity
 
 
+def hotkey_conflicts(hotkeys):
+    """Return the setting keys that share a key, so the menu can explain the clash."""
+    seen = {}
+    conflicts = []
+    for key in HOTKEY_SETTING_KEYS:
+        value = hotkeys.get(key)
+        if value in seen:
+            conflicts.extend([seen[value], key])
+        else:
+            seen[value] = key
+    return conflicts
+
+
+def unique_hotkeys(hotkeys):
+    """Give every action its own key, keeping valid choices and filling the rest."""
+    used = set()
+    result = {}
+    for key in HOTKEY_SETTING_KEYS:
+        value = hotkeys.get(key)
+        if value not in HOTKEY_OPTIONS or value in used:
+            value = next((candidate for candidate in (DEFAULT_HOTKEYS[key], *HOTKEY_OPTIONS)
+                          if candidate not in used), None)
+        used.add(value)
+        result[key] = value
+    return result
+
+
 def normalize_settings(data):
     """Ignore unknown/invalid fields while preserving every valid preference."""
     result = {**DEFAULT_SETTINGS, "preferred_sources": {}}
@@ -69,13 +111,17 @@ def normalize_settings(data):
     for key, options in choices.items():
         if isinstance(data.get(key), str) and data[key] in options:
             result[key] = data[key]
-    for key, minimum, maximum in (("fps", 30, 120), ("sharpness", 0, 100)):
+    for key, minimum, maximum in (("fps", 30, 120), ("sharpness", 0, 100),
+                                  ("frame_multiplier", MULTIPLIER_MIN, MULTIPLIER_MAX)):
         value = data.get(key)
         if type(value) is int and minimum <= value <= maximum:
             result[key] = value
-    for key in ("fg_enabled", "ultra_smooth", "performance_mode", "low_latency"):
+    if result["frame_multiplier"] % MULTIPLIER_STEP:
+        result["frame_multiplier"] = DEFAULT_SETTINGS["frame_multiplier"]
+    for key in ("fg_enabled", "ultra_smooth", "performance_mode", "low_latency", "show_fps"):
         if isinstance(data.get(key), bool):
             result[key] = data[key]
+    result.update(unique_hotkeys(data))
     preferences = data.get("preferred_sources")
     if isinstance(preferences, dict):
         for kind in ("window", "display"):

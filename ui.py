@@ -1,10 +1,13 @@
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from selector import WindowSelector, DisplaySelector
 from settings import (
-    ALGORITHM_OPTIONS, CAPTURE_MODES, ENGINE_OPTIONS, SCALE_OPTIONS,
-    SettingsStore, normalize_settings, source_identity,
+    ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, ENGINE_OPTIONS,
+    HOTKEY_LABELS, HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
+    MULTIPLIER_MIN, MULTIPLIER_STEP, SCALE_OPTIONS, SettingsStore,
+    hotkey_conflicts, normalize_settings, source_identity,
 )
 
 
@@ -30,7 +33,9 @@ class GameSelectorUI:
         "scale": "scale_var", "algo": "algo_var", "sharpness": "sharp_var",
         "fg_enabled": "fg_var", "engine_type": "engine_var",
         "ultra_smooth": "ultra_smooth_var", "performance_mode": "perf_mode_var",
-        "low_latency": "low_latency_var",
+        "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
+        "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
+        "hotkey_fps": "hotkey_fps_var", "hotkey_fsr": "hotkey_fsr_var",
     }
 
     def __init__(self, settings_store=None):
@@ -77,6 +82,10 @@ class GameSelectorUI:
         self.session_summary_var = tk.StringVar(self.root)
         self.fps_value_var = tk.StringVar(self.root)
         self.sharp_value_var = tk.StringVar(self.root)
+        self.multiplier_value_var = tk.StringVar(self.root)
+        self.multiplier_hint_var = tk.StringVar(self.root)
+        self.shortcuts_hint_var = tk.StringVar(self.root)
+        self._settings_dialog = None
 
         self._setup_style()
         self._setup_ui()
@@ -246,11 +255,13 @@ class GameSelectorUI:
         footer.grid(row=2, column=0, sticky="ew", padx=28, pady=(18, 22))
         footer.columnconfigure(0, weight=1)
         self._label(footer, textvariable=self.session_summary_var, bold=True).grid(row=0, column=0, sticky="w")
-        self._label(footer, "F9 FSR  ·  F10 FPS  ·  F11 menu  ·  Ctrl + Enter inicia o overlay",
-                    muted=True, size=9).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self._button(footer, "Sair", self._on_close).grid(row=0, column=1, rowspan=2, padx=(12, 10))
+        self._label(footer, textvariable=self.shortcuts_hint_var, muted=True, size=9).grid(
+            row=1, column=0, sticky="w", pady=(4, 0))
+        self._button(footer, "⚙  Configurações", self._open_settings_dialog).grid(
+            row=0, column=1, rowspan=2, padx=(12, 10))
+        self._button(footer, "Sair", self._on_close).grid(row=0, column=2, rowspan=2, padx=(0, 10))
         self.start_button = self._button(footer, "Iniciar overlay  →", self._on_select, primary=True)
-        self.start_button.grid(row=0, column=2, rowspan=2)
+        self.start_button.grid(row=0, column=3, rowspan=2)
 
     def _setup_source_card(self, card):
         title = tk.Frame(card, bg=COLORS["panel"])
@@ -318,9 +329,9 @@ class GameSelectorUI:
         return ttk.Combobox(parent, textvariable=variable, values=values, state="readonly", width=width,
                             style="App.TCombobox", font=("Segoe UI", 10))
 
-    def _slider(self, parent, variable, minimum, maximum):
+    def _slider(self, parent, variable, minimum, maximum, resolution=1):
         return tk.Scale(parent, from_=minimum, to=maximum, variable=variable, orient=tk.HORIZONTAL,
-                        resolution=1, showvalue=False, highlightthickness=0, bd=0, relief=tk.FLAT,
+                        resolution=resolution, showvalue=False, highlightthickness=0, bd=0, relief=tk.FLAT,
                         bg=COLORS["panel"], fg=COLORS["text"], troughcolor=COLORS["input"],
                         activebackground=COLORS["accent_hover"], sliderrelief=tk.FLAT,
                         sliderlength=18, width=8, cursor="hand2")
@@ -381,10 +392,156 @@ class GameSelectorUI:
                                         "Cria frames intermediários para mais fluidez.", self.fg_var)
         self.engine_combo = self._combo(generation, self.engine_var, ENGINE_OPTIONS)
         self.engine_combo.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        multiplier_line = tk.Frame(generation, bg=COLORS["panel"])
+        multiplier_line.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        multiplier_line.columnconfigure(0, weight=1)
+        self._label(multiplier_line, "Geração de frames", bold=True).grid(row=0, column=0, sticky="w")
+        self._label(multiplier_line, textvariable=self.multiplier_value_var, bold=True).grid(
+            row=0, column=1, sticky="e")
+        self.multiplier_scale = self._slider(generation, self.multiplier_var, MULTIPLIER_MIN,
+                                             MULTIPLIER_MAX, resolution=MULTIPLIER_STEP)
+        self.multiplier_scale.grid(row=4, column=0, sticky="ew", pady=(6, 3))
+        self.multiplier_hint_label = self._label(generation, textvariable=self.multiplier_hint_var,
+                                                 muted=True, size=9, justify=tk.LEFT)
+        self.multiplier_hint_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
+        generation.bind("<Configure>", lambda event: self.multiplier_hint_label.config(
+            wraplength=max(200, event.width - 24)))
         advanced = self._section(parent, "AJUSTES AVANÇADOS", 3)
         self.ultra_smooth_check = self._toggle_row(advanced, 1, "Ultra Smooth", "Maior precisão na interpolação.", self.ultra_smooth_var)
         self.perf_mode_check = self._toggle_row(advanced, 2, "Modo de desempenho", "Resolução interna de até 1280 × 720.", self.perf_mode_var)
         self.low_latency_check = self._toggle_row(advanced, 3, "Baixa latência", "Buffer menor para uma resposta mais rápida.", self.low_latency_var)
+
+    def _open_settings_dialog(self):
+        """Modal dialog for the global hotkeys and overlay preferences."""
+        if self._settings_dialog is not None and self._settings_dialog.winfo_exists():
+            self._settings_dialog.lift()
+            self._settings_dialog.focus_force()
+            return
+        dialog = tk.Toplevel(self.root)
+        self._settings_dialog = dialog
+        dialog.title("Configurações")
+        dialog.configure(bg=COLORS["panel"])
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+
+        body = tk.Frame(dialog, bg=COLORS["panel"])
+        body.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 8))
+        body.columnconfigure(0, weight=1)
+        self._label(body, "Configurações", size=16, bold=True).grid(row=0, column=0, sticky="w")
+        self._label(body, "Atalhos globais e preferências do overlay.", muted=True, size=9).grid(
+            row=1, column=0, sticky="w", pady=(4, 0))
+
+        hotkeys = self._section(body, "ATALHOS GLOBAIS", 2)
+        fields = tk.Frame(hotkeys, bg=COLORS["panel"])
+        fields.grid(row=1, column=0, sticky="ew")
+        fields.columnconfigure(1, weight=1)
+        dialog_vars = {}
+        for row, key in enumerate(HOTKEY_SETTING_KEYS):
+            variable = tk.StringVar(dialog, value=getattr(self, f"{key}_var").get())
+            dialog_vars[key] = variable
+            self._label(fields, HOTKEY_LABELS[key], size=9).grid(row=row, column=0, sticky="w",
+                                                                 pady=(0, 8), padx=(0, 14))
+            combo = self._combo(fields, variable, HOTKEY_OPTIONS, width=6)
+            combo.grid(row=row, column=1, sticky="e", pady=(0, 8))
+            combo.bind("<<ComboboxSelected>>", lambda event: self._validate_dialog_hotkeys(dialog_vars))
+        self.dialog_error_var = tk.StringVar(dialog)
+        self.dialog_error_label = self._label(hotkeys, textvariable=self.dialog_error_var,
+                                              muted=True, size=9, justify=tk.LEFT)
+        self.dialog_error_label.grid(row=2, column=0, sticky="w", pady=(0, 6))
+        hotkeys.bind("<Configure>", lambda event: self.dialog_error_label.config(
+            wraplength=max(220, event.width - 24)))
+
+        overlay = self._section(body, "OVERLAY", 3)
+        show_fps = tk.BooleanVar(dialog, value=bool(self.show_fps_var.get()))
+        dialog_vars["show_fps"] = show_fps
+        self._toggle_row(overlay, 1, "Contador de FPS ao iniciar",
+                         "Mostra o painel de status assim que o overlay abre.", show_fps)
+
+        preferences = self._section(body, "PREFERÊNCIAS", 4)
+        self._label(preferences, "Arquivo de preferências (salvo automaticamente):", muted=True, size=9).grid(
+            row=1, column=0, sticky="w")
+        self._label(preferences, str(self.settings_store.path), muted=True, size=9,
+                    justify=tk.LEFT).grid(row=2, column=0, sticky="w", pady=(2, 10))
+        actions = tk.Frame(preferences, bg=COLORS["panel"])
+        actions.grid(row=3, column=0, sticky="w")
+        self._button(actions, "Abrir pasta", self._open_settings_folder).grid(row=0, column=0)
+        self._button(actions, "Restaurar padrões", lambda: self._reset_dialog(dialog_vars)).grid(
+            row=0, column=1, padx=(8, 0))
+
+        buttons = tk.Frame(dialog, bg=COLORS["panel"])
+        buttons.grid(row=1, column=0, sticky="ew", padx=24, pady=(8, 22))
+        buttons.columnconfigure(0, weight=1)
+        self._label(buttons, "Esc cancela  ·  Enter salva", muted=True, size=9).grid(row=0, column=0, sticky="w")
+        self._button(buttons, "Cancelar", self._close_settings_dialog).grid(row=0, column=1, padx=(8, 8))
+        self._button(buttons, "Salvar", lambda: self._apply_dialog_settings(dialog_vars),
+                     primary=True).grid(row=0, column=2)
+
+        dialog.protocol("WM_DELETE_WINDOW", self._close_settings_dialog)
+        dialog.bind("<Escape>", lambda event: self._close_settings_dialog())
+        dialog.bind("<Return>", lambda event: self._apply_dialog_settings(dialog_vars))
+        self._center_dialog(dialog)
+        dialog.grab_set()
+        dialog.focus_force()
+
+    def _center_dialog(self, dialog):
+        dialog.update_idletasks()
+        width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 3)
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _validate_dialog_hotkeys(self, dialog_vars):
+        """Returns True when every action owns a different key."""
+        hotkeys = {key: variable.get() for key, variable in dialog_vars.items()
+                   if key in HOTKEY_SETTING_KEYS}
+        conflicts = hotkey_conflicts(hotkeys)
+        if conflicts:
+            names = ", ".join(sorted({HOTKEY_LABELS[key].split(" (")[0] for key in conflicts}))
+            self.dialog_error_var.set(f"Cada atalho precisa de uma tecla diferente: {names}.")
+            self.dialog_error_label.config(fg=COLORS["warning"])
+            return False
+        self.dialog_error_var.set("Cada atalho usa uma tecla diferente.")
+        self.dialog_error_label.config(fg=COLORS["success"])
+        return True
+
+    def _reset_dialog(self, dialog_vars):
+        for key in HOTKEY_SETTING_KEYS:
+            dialog_vars[key].set(DEFAULT_SETTINGS[key])
+        dialog_vars["show_fps"].set(DEFAULT_SETTINGS["show_fps"])
+        self._validate_dialog_hotkeys(dialog_vars)
+
+    def _open_settings_folder(self):
+        folder = self.settings_store.path.parent
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(folder)  # noqa: S606 - opens the user's own settings folder
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as exc:
+            messagebox.showinfo("Pasta de preferências", f"{folder}\n\n{exc}", parent=self.root)
+
+    def _close_settings_dialog(self):
+        if self._settings_dialog is not None:
+            dialog, self._settings_dialog = self._settings_dialog, None
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+    def _apply_dialog_settings(self, dialog_vars):
+        if not self._validate_dialog_hotkeys(dialog_vars):
+            messagebox.showwarning("Atalhos repetidos",
+                                   "Escolha uma tecla diferente para cada atalho.", parent=self._settings_dialog)
+            return
+        for key in HOTKEY_SETTING_KEYS:
+            getattr(self, f"{key}_var").set(dialog_vars[key].get())
+        self.show_fps_var.set(bool(dialog_vars["show_fps"].get()))
+        self._close_settings_dialog()
+        self._save_settings(notify=True)
 
     def _bind_settings_scroll(self, widget):
         widget.bind("<MouseWheel>", self._scroll_settings, add="+")
@@ -502,13 +659,32 @@ class GameSelectorUI:
 
     def _update_setting_display(self):
         fps = self.fps_var.get()
+        multiplier = self.multiplier_var.get()
+        generation_on = bool(self.fg_var.get())
         self.fps_value_var.set(f"{fps} FPS")
         self.sharp_value_var.set(f"{self.sharp_var.get()}%")
+        self.multiplier_value_var.set(f"x{multiplier}")
         for value, button in self.fps_presets.items():
             button.config(bg=COLORS["accent_dim"] if fps == value else COLORS["input"])
-        self.engine_combo.configure(state="readonly" if self.fg_var.get() else "disabled")
+        self.engine_combo.configure(state="readonly" if generation_on else "disabled")
+        self.multiplier_scale.configure(state=tk.NORMAL if generation_on else tk.DISABLED)
+        if not generation_on:
+            hint = "Ative a interpolação de quadros para usar a geração de frames."
+            tone = "muted"
+        else:
+            capture_fps = max(1, round(fps / multiplier))
+            hint = (f"{multiplier - 1} frame(s) extra(s) por par  ·  captura a {capture_fps} FPS"
+                    f"  ·  saída a {fps} FPS")
+            if multiplier >= 8:
+                hint += "  ·  pesa mais em GPUs fracas"
+            tone = "warning" if multiplier >= 8 else "muted"
+        self.multiplier_hint_var.set(hint)
+        self.multiplier_hint_label.config(fg=COLORS[tone])
+        self.shortcuts_hint_var.set(
+            f"{self.hotkey_stop_var.get()} menu  ·  {self.hotkey_fps_var.get()} FPS  ·  "
+            f"{self.hotkey_fsr_var.get()} FSR  ·  Ctrl + Enter inicia o overlay")
         scale = "Tela cheia" if self.scale_var.get() == "Fullscreen" else f"{self.scale_var.get()}×"
-        generation = "Geração de quadros ativa" if self.fg_var.get() else "Somente escala / filtro"
+        generation = f"x{multiplier} interpolação" if generation_on else "Somente escala / filtro"
         self.session_summary_var.set(f"{fps} FPS  ·  {scale}  ·  {generation}")
 
     def _on_settings_change(self, *args):
@@ -578,6 +754,7 @@ class GameSelectorUI:
     def _on_close(self, event=None):
         if self._closing:
             return
+        self._close_settings_dialog()
         self._remember_selected_source()
         self._save_settings(notify=True)
         self._close_root()

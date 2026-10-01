@@ -12,10 +12,75 @@ from ui import GameSelectorUI
 from selector import get_source_rect, get_source_monitor_rect
 from tkinter import messagebox
 from filters import AMDFilters, NvidiaAIUpscaler
+from settings import (DEFAULT_HOTKEYS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
+                      MULTIPLIER_MIN, MULTIPLIER_STEP)
 import win32gui
 import win32con
 import win32api
 import os
+
+# Fallbacks keep the overlay usable if a saved hotkey is missing or invalid.
+DEFAULT_HOTKEY_VK = {"stop": 0x7A, "fps": 0x79, "fsr": 0x78}
+DEFAULT_HOTKEY_NAMES = {action: DEFAULT_HOTKEYS[f"hotkey_{action}"] for action in DEFAULT_HOTKEY_VK}
+
+
+def hotkey_vk_code(name, fallback):
+    """Map a configured key name such as ``F9`` to its Windows virtual-key code."""
+    if isinstance(name, str):
+        digits = name.strip().upper().lstrip("F")
+        if digits.isdigit() and 1 <= int(digits) <= 12:
+            return 0x6F + int(digits)
+    return fallback
+
+
+def capture_interval(target_fps, multiplier):
+    """Seconds between captures: FPS / multiplier, so generated frames fill the rest."""
+    try:
+        multiplier = max(1, int(multiplier or 1))
+    except (TypeError, ValueError):
+        multiplier = 2
+    rate = (target_fps / multiplier) if target_fps and target_fps > 0 else (30.0 / multiplier)
+    return 1.0 / rate if rate > 0 else 1.0
+
+
+def queue_sizes(multiplier, low_latency=True):
+    """Buffer sizes for the pipeline: generated frames arrive in bursts."""
+    try:
+        multiplier = max(1, int(multiplier or 2))
+    except (TypeError, ValueError):
+        multiplier = 2
+    process_size = min(8, max(3, multiplier))
+    display_size = min(30, max(3, multiplier)) if low_latency else min(45, max(15, multiplier * 2))
+    return 2, process_size, display_size
+
+
+def effective_capture_multiplier(fg_enabled, multiplier):
+    """Interpolation fills the gaps, so captures slow down by the multiplier.
+
+    With generation disabled nothing fills those gaps, so the capture has to keep
+    the full target rate or the overlay would run at a fraction of it.
+    """
+    if not fg_enabled:
+        return 1
+    try:
+        return max(1, int(multiplier or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
+def interpolation_timesteps(multiplier):
+    """Positions of the intermediate frames generated between two captured frames.
+
+    ``multiplier`` of 2 doubles the source rate with one frame at the midpoint;
+    larger values spread the intermediates evenly across the pair.
+    """
+    try:
+        multiplier = int(multiplier)
+    except (TypeError, ValueError):
+        multiplier = 2
+    multiplier = max(1, multiplier)
+    return [index / multiplier for index in range(1, multiplier)]
+
 
 HUD_COLORS = {
     "accent": (118, 149, 255),
@@ -59,9 +124,11 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
 
     fg_enabled = engine_config.get("fg_enabled", True)
     internal_res = engine_config.get("internal_res", (800, 600))
+    multiplier = max(1, int(engine_config.get("frame_multiplier", 2) or 2))
+    timesteps = interpolation_timesteps(multiplier) if fg_enabled else []
     last_frame = None
 
-    print(f"Sub-process processing worker started (PID: {os.getpid()})")
+    print(f"Sub-process processing worker started (PID: {os.getpid()}, frame gen x{multiplier})")
     
     while not stop_event.is_set():
         try:
@@ -73,12 +140,10 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
             if w > internal_res[0] or h > internal_res[1]:
                 current_frame = cv2.resize(current_frame, internal_res, interpolation=cv2.INTER_LINEAR)
 
-            if fg_enabled and last_frame is not None:
-                inter_frame = engine.interpolate(last_frame, current_frame)
-                process_queue.put(inter_frame)
-                process_queue.put(current_frame)
-            else:
-                process_queue.put(current_frame)
+            if timesteps and last_frame is not None:
+                for timestep in timesteps:
+                    process_queue.put(engine.interpolate(last_frame, current_frame, timestep))
+            process_queue.put(current_frame)
             
             last_frame = current_frame
         except:
@@ -106,6 +171,9 @@ class FrameGenerationApp:
         self.last_rect = None
         self.show_fps = True
         self.hotkey_cooldown = 0
+        self.frame_multiplier = 2
+        self.hotkeys = dict(DEFAULT_HOTKEY_VK)
+        self.hotkey_names = dict(DEFAULT_HOTKEY_NAMES)
         self.scale_factor = 1.0
         self.upscale_algo = cv2.INTER_LINEAR
         self.sharpness = 0.3
@@ -118,8 +186,9 @@ class FrameGenerationApp:
     def capture_worker(self):
         print("Capture worker started")
         last_frame = None
-        # Target capture is exactly half the display FPS
-        capture_interval = 1.0 / (self.target_fps / 2) if self.target_fps > 0 else 1.0/30.0
+        multiplier = effective_capture_multiplier(getattr(self, "fg_enabled", True),
+                                                   getattr(self, "frame_multiplier", 2))
+        interval = capture_interval(self.target_fps, multiplier)
 
         last_capture_time = time.perf_counter()
 
@@ -136,7 +205,7 @@ class FrameGenerationApp:
                         break
 
                 now = time.perf_counter()
-                if now - last_capture_time < capture_interval:
+                if now - last_capture_time < interval:
                     time.sleep(0.001)
                     continue
 
@@ -254,11 +323,34 @@ class FrameGenerationApp:
             self.engine = RIFEEngine()
             
         self.engine.set_high_precision(self.ultra_smooth) if hasattr(self.engine, 'set_high_precision') else None
-        
+
+        # Frame generation multiplier: how many output frames each captured pair becomes.
+        multiplier = self.target_source.get("frame_multiplier", 2)
+        if (type(multiplier) is not int or not MULTIPLIER_MIN <= multiplier <= MULTIPLIER_MAX
+                or multiplier % MULTIPLIER_STEP):
+            multiplier = 2
+        self.frame_multiplier = multiplier
+        self.show_fps = self.target_source.get("show_fps", True)
+
+        # Hotkeys are configurable; fall back to F11/F10/F9 for missing values.
+        self.hotkeys = {}
+        self.hotkey_names = {}
+        for setting_key in HOTKEY_SETTING_KEYS:
+            action = setting_key.removeprefix("hotkey_")
+            name = self.target_source.get(setting_key)
+            if not isinstance(name, str) or not name:
+                name = DEFAULT_HOTKEY_NAMES[action]
+            self.hotkey_names[action] = name
+            self.hotkeys[action] = hotkey_vk_code(name, DEFAULT_HOTKEY_VK[action])
+
         # Adaptive Buffer based on latency selection
         self.low_latency = self.target_source.get("low_latency", True)
-        display_buf_size = 3 if self.low_latency else 15
-        self.display_queue = Queue(maxsize=display_buf_size)
+
+        # Queues sized so a burst of generated frames has somewhere to wait.
+        capture_size, process_size, display_size = queue_sizes(multiplier, self.low_latency)
+        self.capture_queue = multiprocessing.Queue(maxsize=capture_size)
+        self.process_queue = multiprocessing.Queue(maxsize=process_size)
+        self.display_queue = Queue(maxsize=display_size)
 
         # Performance tuning: Set internal resolution limit
         # Performance Mode (Alta Res) uses 1280x720, Standard uses 800x600
@@ -274,8 +366,9 @@ class FrameGenerationApp:
         else:
             self.display_dim = (int(w * self.scale_factor), int(h * self.scale_factor))
 
-        print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | FPS: {self.target_fps} | Scale: {scale_val}")
-        print("Press F11 to stop, F10 to toggle FPS.")
+        print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | FPS: {self.target_fps} | Scale: {scale_val} | Frame gen: x{multiplier}")
+        print(f"Press {self.hotkey_names['stop']} to stop, {self.hotkey_names['fps']} to toggle FPS, "
+              f"{self.hotkey_names['fsr']} to toggle FSR.")
         return True
 
     def _hud_parts(self, font, small_font):
@@ -286,7 +379,7 @@ class FrameGenerationApp:
             return cached[1]
         fps_value = font.render(f"{round(self.current_fps)}", True, HUD_COLORS["accent"])
         fps_label = small_font.render("FPS", True, HUD_COLORS["muted"])
-        hint = small_font.render("F11  menu", True, HUD_COLORS["muted"])
+        hint = small_font.render(f"{self.hotkey_names['stop']}  menu", True, HUD_COLORS["muted"])
         chips = []
         for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth):
             color = HUD_COLORS[state]
@@ -396,6 +489,7 @@ class FrameGenerationApp:
             "engine_type": self.target_source.get("engine_type"),
             "ultra_smooth": self.ultra_smooth,
             "fg_enabled": self.fg_enabled,
+            "frame_multiplier": self.frame_multiplier,
             "internal_res": self.internal_res
         }
         
@@ -419,9 +513,8 @@ class FrameGenerationApp:
 
         try:
             while self.running:
-                # 4. Check for Global Hotkey (F11)
-                # VK_F11 = 0x7A
-                if win32api.GetAsyncKeyState(0x7A) & 0x8000:
+                # 4. Check for the configured stop hotkey
+                if win32api.GetAsyncKeyState(self.hotkeys["stop"]) & 0x8000:
                     print("Stop key pressed. Returning to menu...")
                     self.running = False
                     break
@@ -488,12 +581,12 @@ class FrameGenerationApp:
                     screen.blit(surface, (0, 0))
                     
                     # Hotkeys & Stats
-                    if win32api.GetAsyncKeyState(0x79) & 0x8000: # F10
+                    if win32api.GetAsyncKeyState(self.hotkeys["fps"]) & 0x8000:
                         if time.time() - self.hotkey_cooldown > 0.3:
                             self.show_fps = not self.show_fps
                             self.hotkey_cooldown = time.time()
                     
-                    if win32api.GetAsyncKeyState(0x78) & 0x8000: # F9
+                    if win32api.GetAsyncKeyState(self.hotkeys["fsr"]) & 0x8000:
                         if time.time() - self.hotkey_cooldown > 0.3:
                             self.fsr_mode = not self.fsr_mode
                             self.hotkey_cooldown = time.time()

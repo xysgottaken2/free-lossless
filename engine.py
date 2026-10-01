@@ -37,12 +37,16 @@ class RIFEEngine:
             self.dis.setVariationalRefinementIterations(0)
             print("Engine set to STANDARD Precision")
 
-    def interpolate(self, frame1, frame2):
+    def interpolate(self, frame1, frame2, timestep=0.5):
         """
         Interpolate between frame1 and frame2 using stabilized bilateral warping.
+
+        ``timestep`` positions the result between both frames (0 = frame1, 1 = frame2),
+        which allows generating several intermediate frames per captured pair.
         """
         if frame1.shape != frame2.shape:
             return frame2
+        timestep = min(1.0, max(0.0, float(timestep)))
 
         h, w = frame1.shape[:2]
         
@@ -102,13 +106,13 @@ class RIFEEngine:
         # Motion magnitude for adaptive blending
         mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
         
-        # Forward warp map (frame1 -> mid)
-        m1_x = self.map_x + flow[..., 0] * 0.5
-        m1_y = self.map_y + flow[..., 1] * 0.5
+        # Forward warp map (frame1 -> intermediate frame)
+        m1_x = self.map_x + flow[..., 0] * timestep
+        m1_y = self.map_y + flow[..., 1] * timestep
         
-        # Backward warp map (frame2 -> mid)
-        m2_x = self.map_x - flow[..., 0] * 0.5
-        m2_y = self.map_y - flow[..., 1] * 0.5
+        # Backward warp map (frame2 -> intermediate frame)
+        m2_x = self.map_x - flow[..., 0] * (1.0 - timestep)
+        m2_y = self.map_y - flow[..., 1] * (1.0 - timestep)
         
         # Warp both
         inter1 = cv2.remap(frame1, m1_x, m1_y, cv2.INTER_LINEAR)
@@ -121,10 +125,10 @@ class RIFEEngine:
         # Weighted combination: 
         # In low motion, use full warping. 
         # In high motion, mix with cross-fade to hide artifacts.
-        combined = cv2.addWeighted(inter1, 0.5, inter2, 0.5, 0)
+        combined = cv2.addWeighted(inter1, 1.0 - timestep, inter2, timestep, 0)
         
         if np.max(blend_mask) > 0.05:
-            cross_fade = cv2.addWeighted(frame1, 0.5, frame2, 0.5, 0)
+            cross_fade = cv2.addWeighted(frame1, 1.0 - timestep, frame2, timestep, 0)
             mask_3c = cv2.merge([blend_mask, blend_mask, blend_mask])
             # Factor 0.4 ensures we still see some motion even in high-speed areas
             final = combined * (1.0 - mask_3c * 0.4) + cross_fade * (mask_3c * 0.4)
@@ -190,9 +194,11 @@ class RIFEONNXEngine:
         except Exception as e:
             print(f"Error initializing RIFE ONNX session: {e}")
 
-    def interpolate(self, frame1, frame2):
+    def interpolate(self, frame1, frame2, timestep=0.5):
         if self.session is None:
             return frame2
+        timestep = min(1.0, max(0.0, float(timestep)))
+        time_array = np.array([timestep], dtype=np.float32)
             
         h, w = frame1.shape[:2]
         
@@ -210,7 +216,7 @@ class RIFEONNXEngine:
         input_dict = {
             "img0": img1,
             "img1": img2,
-            "timestep": np.array([0.5], dtype=np.float32)
+            "timestep": time_array
         }
         
         try:
@@ -230,7 +236,7 @@ class RIFEONNXEngine:
                     inputs[1]: img2
                 }
                 if len(inputs) > 2:
-                    alt_dict[inputs[2]] = np.array([0.5], dtype=np.float32)
+                    alt_dict[inputs[2]] = time_array
                 output = self.session.run(None, alt_dict)[0]
                 res = (np.clip(output[0].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
                 return res
@@ -249,8 +255,9 @@ if __name__ == "__main__":
     cv2.circle(f2, (200, 100), 50, (255, 0, 0), -1)
     
     print("Testing interpolation...")
-    start = time.time()
-    result = engine.interpolate(f1, f2)
-    end = time.time()
-    print(f"Interpolation took: {end - start:.4f} seconds ({1/(end-start):.2f} FPS)")
-    cv2.imwrite("test_inter.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+    for step in (0.25, 0.5, 0.75):
+        start = time.time()
+        result = engine.interpolate(f1, f2, timestep=step)
+        end = time.time()
+        print(f"t={step}: {end - start:.4f} seconds ({1/(end-start):.2f} FPS)")
+        cv2.imwrite(f"test_inter_{int(step * 100)}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR))

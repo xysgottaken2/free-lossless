@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from settings import SettingsStore, get_settings_path, normalize_settings, source_identity
+from settings import (
+    DEFAULT_SETTINGS, HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, SettingsStore, get_settings_path,
+    hotkey_conflicts, normalize_settings, source_identity, unique_hotkeys,
+)
 
 
 class SettingsTests(unittest.TestCase):
@@ -114,6 +117,54 @@ class SettingsTests(unittest.TestCase):
     def test_non_windows_path_respects_xdg_config_home(self):
         with patch("settings.sys.platform", "linux"), patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.path.parent)}):
             self.assertEqual(get_settings_path(), self.path.parent / "free-lossless" / "settings.json")
+
+    def test_frame_multiplier_defaults_to_doubling(self):
+        self.assertEqual(normalize_settings(None)["frame_multiplier"], 2)
+
+    def test_frame_multiplier_accepts_even_values_within_range(self):
+        for value in (2, 4, 6, 10, 20):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_settings({"frame_multiplier": value})["frame_multiplier"], value)
+
+    def test_invalid_frame_multipliers_fall_back_to_doubling(self):
+        for value in (0, 1, 21, 22, 7, 3.0, True, "4", None):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_settings({"frame_multiplier": value})["frame_multiplier"], 2)
+
+    def test_hotkeys_default_to_f11_f10_f9(self):
+        loaded = normalize_settings(None)
+        self.assertEqual({key: loaded[key] for key in HOTKEY_SETTING_KEYS},
+                         {"hotkey_stop": "F11", "hotkey_fps": "F10", "hotkey_fsr": "F9"})
+
+    def test_hotkeys_keep_valid_choices_and_reject_unknown_keys(self):
+        loaded = normalize_settings({"hotkey_stop": "F4", "hotkey_fps": "Ctrl+Q", "hotkey_fsr": "f8"})
+        self.assertEqual(loaded["hotkey_stop"], "F4")
+        self.assertEqual(loaded["hotkey_fps"], "F10")  # unknown name keeps the default
+        self.assertEqual(loaded["hotkey_fsr"], "F9")   # names are case sensitive
+        self.assertEqual(len(set(HOTKEY_OPTIONS)), 12)
+        self.assertTrue(all(option.startswith("F") for option in HOTKEY_OPTIONS))
+
+    def test_duplicate_hotkeys_are_split_onto_free_keys(self):
+        resolved = unique_hotkeys({"hotkey_stop": "F5", "hotkey_fps": "F5", "hotkey_fsr": "F5"})
+        self.assertEqual(resolved["hotkey_stop"], "F5")
+        self.assertEqual(len(set(resolved.values())), 3)
+        self.assertTrue(all(value in HOTKEY_OPTIONS for value in resolved.values()))
+
+    def test_conflicting_hotkeys_can_be_reported_to_the_user(self):
+        self.assertEqual(hotkey_conflicts({"hotkey_stop": "F5", "hotkey_fps": "F6", "hotkey_fsr": "F7"}), [])
+        conflicts = hotkey_conflicts({"hotkey_stop": "F5", "hotkey_fps": "F6", "hotkey_fsr": "F5"})
+        self.assertEqual(set(conflicts), {"hotkey_stop", "hotkey_fsr"})
+
+    def test_show_fps_preference_is_loaded_and_saved(self):
+        self.assertTrue(normalize_settings(None)["show_fps"])
+        self.assertFalse(normalize_settings({"show_fps": False})["show_fps"])
+        self.assertEqual(normalize_settings({"show_fps": "no"})["show_fps"], DEFAULT_SETTINGS["show_fps"])
+
+    def test_new_preferences_survive_a_full_round_trip(self):
+        preferences = normalize_settings({"frame_multiplier": 12, "hotkey_stop": "F3",
+                                          "hotkey_fps": "F5", "hotkey_fsr": "F7", "show_fps": False})
+        self.store.save(preferences)
+        self.assertEqual(SettingsStore(self.path).load(), preferences)
 
     def test_source_identity_never_includes_runtime_handles(self):
         self.assertEqual(source_identity({"hwnd": 99, "title": "Game", "process": "game.exe"}),

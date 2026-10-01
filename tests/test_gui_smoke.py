@@ -3,12 +3,14 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 from helpers import load_module, stubs
-from settings import SettingsStore, normalize_settings
+from settings import HOTKEY_OPTIONS, SettingsStore, normalize_settings
 
 try:
     import tkinter as tk
+    from tkinter import ttk
 except ImportError:
     tk = None
 
@@ -32,6 +34,8 @@ class RealTkSmokeTests(unittest.TestCase):
              "rect": (-1920, 0, 0, 1080)},
         ]
         self.module = load_module("ui", self.dependencies)
+        # Real message boxes would block the runner.
+        self.module.messagebox = MagicMock()
 
     def make_ui(self):
         ui = self.module.GameSelectorUI(settings_store=self.store)
@@ -41,6 +45,17 @@ class RealTkSmokeTests(unittest.TestCase):
         self.addCleanup(lambda: ui._close_root() if not ui._closing else None)
         ui.root.update()
         return ui
+
+    def widgets(self, parent):
+        for child in parent.winfo_children():
+            yield child
+            yield from self.widgets(child)
+
+    def find(self, parent, kind, label=None):
+        for widget in self.widgets(parent):
+            if isinstance(widget, kind) and (label is None or widget.cget("text") == label):
+                return widget
+        raise AssertionError(f"{kind} {label!r} not found")
 
     def display_button(self, ui):
         def walk(widget):
@@ -77,7 +92,8 @@ class RealTkSmokeTests(unittest.TestCase):
             "source_type": "display", "mode": "dxcam", "fps": 120, "scale": "Fullscreen",
             "algo": "NVIDIA AI SuperRes", "sharpness": 80, "fg_enabled": False,
             "engine_type": "Fast (DIS Flow)", "ultra_smooth": True,
-            "performance_mode": True, "low_latency": False,
+            "performance_mode": True, "low_latency": False, "frame_multiplier": 6,
+            "show_fps": False, "hotkey_stop": "F4", "hotkey_fps": "F6", "hotkey_fsr": "F8",
             "preferred_sources": {"display": {"device": r"\\.\DISPLAY2"}},
         })
         self.store.save(preferences)
@@ -132,6 +148,76 @@ class RealTkSmokeTests(unittest.TestCase):
         self.assertEqual(reopened.tree.selection(), ("0",))
         self.assertEqual(reopened.sources["0"]["hwnd"], 100)
         self.assertEqual(reopened.selected_title_var.get(), "Game — new session")
+
+    def test_frame_generation_slider_saves_and_reaches_the_overlay(self):
+        ui = self.make_ui()
+        # Only even multipliers up to twenty are offered.
+        self.assertEqual(float(ui.multiplier_scale.cget("from")), 2)
+        self.assertEqual(float(ui.multiplier_scale.cget("to")), 20)
+        self.assertEqual(float(ui.multiplier_scale.cget("resolution")), 2)
+        ui.multiplier_var.set(20)
+        ui.root.update()
+        self.assertEqual(ui.multiplier_value_var.get(), "x20")
+        self.assertIn("19 frame(s) extra(s)", ui.multiplier_hint_var.get())
+        self.run_pending_save(ui)
+        self.assertEqual(self.store.load()["frame_multiplier"], 20)
+        ui.tree.selection_set("0")
+        ui._on_select()
+        self.assertEqual(ui.selected_source["frame_multiplier"], 20)
+        reopened = self.make_ui()
+        self.assertEqual(reopened.multiplier_var.get(), 20)
+
+    def test_settings_dialog_applies_hotkeys_and_saves_them(self):
+        ui = self.make_ui()
+        ui._open_settings_dialog()
+        dialog = ui._settings_dialog
+        self.assertIsNotNone(dialog)
+        combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
+        self.assertEqual([list(combo.cget("values")) for combo in combos],
+                         [list(HOTKEY_OPTIONS)] * 3)
+        combos[0].set("F5")
+        combos[1].set("F6")
+        combos[2].set("F7")
+        self.find(dialog, tk.Button, "Salvar").invoke()
+        self.assertIsNone(ui._settings_dialog)
+        ui.root.update()
+        saved = self.store.load()
+        self.assertEqual([saved[key] for key in ("hotkey_stop", "hotkey_fps", "hotkey_fsr")],
+                         ["F5", "F6", "F7"])
+        self.assertEqual(ui.hotkey_stop_var.get(), "F5")
+        self.assertIn("F5 menu", ui.shortcuts_hint_var.get())
+        ui.tree.selection_set("0")
+        ui._on_select()
+        self.assertEqual(ui.selected_source["hotkey_stop"], "F5")
+
+    def test_settings_dialog_rejects_repeated_keys_and_cancel_changes_nothing(self):
+        ui = self.make_ui()
+        ui._open_settings_dialog()
+        dialog = ui._settings_dialog
+        combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
+        combos[1].set("F11")  # already used to stop the overlay
+        self.find(dialog, tk.Button, "Salvar").invoke()
+        ui.root.update()
+        self.assertIsNotNone(ui._settings_dialog)  # the dialog stays open for a fix
+        self.module.messagebox.showwarning.assert_called_once()
+        self.assertEqual(ui.hotkey_fps_var.get(), "F10")
+        combos[1].set("F6")
+        self.find(dialog, tk.Button, "Cancelar").invoke()
+        self.assertIsNone(ui._settings_dialog)
+        self.assertEqual(self.store.load()["hotkey_fps"], "F10")
+        self.assertEqual(ui.hotkey_fps_var.get(), "F10")
+
+    def test_settings_dialog_reset_restores_defaults_in_the_form(self):
+        ui = self.make_ui()
+        ui._open_settings_dialog()
+        dialog = ui._settings_dialog
+        combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
+        combos[0].set("F2")
+        self.find(dialog, tk.Button, "Restaurar padrões").invoke()
+        ui.root.update()
+        self.assertEqual([combo.get() for combo in combos], ["F11", "F10", "F9"])
+        self.find(dialog, tk.Button, "Salvar").invoke()
+        self.assertEqual(self.store.load()["hotkey_stop"], "F11")
 
     def test_small_window_keeps_start_visible_and_advanced_controls_scrollable(self):
         ui = self.make_ui()
