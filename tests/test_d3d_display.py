@@ -8,8 +8,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-os.environ.setdefault("SDL_VIDEODRIVER", "offscreen")
-
 try:
     import pygame
 except ImportError:  # pragma: no cover - pygame ships in requirements.txt
@@ -18,21 +16,36 @@ except ImportError:  # pragma: no cover - pygame ships in requirements.txt
 import d3d_display
 
 
-@unittest.skipIf(pygame is None or d3d_display._video is None, "pygame sem os módulos SDL2")
-class RendererDisplayTests(unittest.TestCase):
+class DisplayTestBase(unittest.TestCase):
+    """Keeps the video environment exactly as it was found.
+
+    The overlay tests that need a real window run later in the same process, so a
+    driver forced here (or a pygame.quit()) would break them on a real desktop.
+    """
+
     @classmethod
     def setUpClass(cls):
-        cls.original = os.environ.get("SDL_VIDEODRIVER")
-        os.environ["SDL_VIDEODRIVER"] = "offscreen"
+        if pygame is None:
+            raise unittest.SkipTest("pygame não está instalado")
+        cls.driver_before = os.environ.get("SDL_VIDEODRIVER")
+        cls.pygame_was_ready = pygame.get_init()
+        if os.name != "nt":
+            # A headless Linux machine has no window to open; Windows has one.
+            os.environ["SDL_VIDEODRIVER"] = "offscreen"
         pygame.init()
 
     @classmethod
     def tearDownClass(cls):
-        pygame.quit()
-        if cls.original is None:
+        if cls.driver_before is None:
             os.environ.pop("SDL_VIDEODRIVER", None)
         else:
-            os.environ["SDL_VIDEODRIVER"] = cls.original
+            os.environ["SDL_VIDEODRIVER"] = cls.driver_before
+        if not cls.pygame_was_ready:
+            pygame.quit()
+
+
+@unittest.skipIf(pygame is None or d3d_display._video is None, "pygame sem os módulos SDL2")
+class RendererDisplayTests(DisplayTestBase):
 
     def make(self, size=(320, 240)):
         display = d3d_display.RendererDisplay("FreeLossless teste", size)
@@ -90,15 +103,7 @@ class RendererDisplayTests(unittest.TestCase):
 
 
 @unittest.skipIf(pygame is None or d3d_display._video is None, "pygame sem os módulos SDL2")
-class CreateDisplayTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        os.environ["SDL_VIDEODRIVER"] = "offscreen"
-        pygame.init()
-
-    @classmethod
-    def tearDownClass(cls):
-        pygame.quit()
+class CreateDisplayTests(DisplayTestBase):
 
     def test_gdi_returns_a_display_surface_and_no_presenter(self):
         surface, presenter, description = d3d_display.create_display("GDI", "t", (160, 120))

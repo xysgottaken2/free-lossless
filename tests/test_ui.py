@@ -429,22 +429,50 @@ class ReshadeSectionTests(unittest.TestCase):
             self.ui._refresh_reshade_status()
             self.assertIn("not installed", self.ui.reshade_status_var.set.call_args.args[0])
 
-    def test_downloading_updates_the_menu_when_it_finishes(self):
+    def test_the_download_starts_in_a_thread_and_the_menu_polls(self):
         from unittest.mock import patch
         self.ui.root = MagicMock()
-        self.ui.root.after.side_effect = lambda delay, callback: callback()
-        with patch.object(self.module, "reshade") as reshade:
-            reshade.download_installer.return_value = (r"C:\App\ReShade_Setup.exe", None)
+        self.ui._closing = False
+        with patch.object(self.module, "threading") as threading, \
+                patch.object(self.module, "reshade"):
             self.ui._download_reshade()
-            self.assertIn("ReShade_Setup.exe", self.ui.reshade_status_var.set.call_args.args[0])
+            self.assertTrue(threading.Thread.return_value.start.called)
+        self.ui.reshade_button.config.assert_called_with(state=self.deps["tkinter"].DISABLED)
+        self.assertIn("Downloading", self.ui.reshade_status_var.set.call_args.args[0])
+        self.assertTrue(self.ui.root.after.called)
+
+    def test_the_poll_waits_while_the_download_is_running(self):
+        self.ui.root = MagicMock()
+        self.ui._closing = False
+        self.ui.root.after.reset_mock()
+        self.ui._reshade_result = None
+        self.ui._poll_reshade_download()
+        self.assertEqual(self.ui.root.after.call_args.args[1].__name__, "_poll_reshade_download")
+        self.assertEqual(self.ui.root.after.call_args.args[0], self.module.RESHADE_POLL_MS)
+
+    def test_a_finished_download_updates_the_menu(self):
+        from unittest.mock import patch
+        self.ui._reshade_result = (r"C:\App\ReShade_Setup.exe", None)
+        with patch.object(self.ui, "_reshade_download_finished") as finished:
+            self.ui._poll_reshade_download()
+        finished.assert_called_once_with(r"C:\App\ReShade_Setup.exe", None)
+        self.assertIsNone(self.ui._reshade_result)
+
+    def test_the_menu_shows_where_the_installer_was_saved(self):
+        from unittest.mock import patch
+        with patch.object(self.module, "reshade") as reshade:
+            self.ui._reshade_download_finished(r"C:\App\ReShade_Setup.exe", None)
             reshade.open_folder.assert_called_once()
+        self.assertIn("ReShade_Setup.exe", self.ui.reshade_status_var.set.call_args.args[0])
 
     def test_a_failed_download_is_shown_and_the_button_comes_back(self):
-        from unittest.mock import patch
+        self.ui._reshade_download_finished(None, "sem rede")
+        self.assertIn("sem rede", self.ui.reshade_status_var.set.call_args.args[0])
+        self.ui.reshade_button.config.assert_called_with(state=self.deps["tkinter"].NORMAL)
+
+    def test_the_poll_stops_when_the_menu_is_closing(self):
         self.ui.root = MagicMock()
-        self.ui.root.after.side_effect = lambda delay, callback: callback()
-        with patch.object(self.module, "reshade") as reshade:
-            reshade.download_installer.return_value = (None, "sem rede")
-            self.ui._download_reshade()
-            self.assertIn("sem rede", self.ui.reshade_status_var.set.call_args.args[0])
-            self.ui.reshade_button.config.assert_called_with(state=self.deps["tkinter"].NORMAL)
+        self.ui._closing = True
+        self.ui._reshade_result = None
+        self.ui._poll_reshade_download()
+        self.assertFalse(self.ui.root.after.called)

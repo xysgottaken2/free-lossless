@@ -47,6 +47,10 @@ MODE_LABEL_KEYS = {"bitblt": "mode.bitblt", "dxcam": "mode.dxcam"}
 ENGINE_LABEL_KEYS = {"AI (RIFE ONNX)": "engine.rife", "Fast (DIS Flow)": "engine.fast"}
 
 
+# How often the menu checks whether the ReShade download finished.
+RESHADE_POLL_MS = 250
+
+
 class GameSelectorUI:
     SAVE_DELAY_MS = 500
     SETTING_VARIABLES = {
@@ -825,12 +829,28 @@ class GameSelectorUI:
         self.reshade_button.config(state=tk.DISABLED)
         self.reshade_status_var.set(_t("reshade.downloading"))
         self.reshade_status_label.config(fg=COLORS["accent"])
+        self._reshade_result = None
+        threading.Thread(target=self._fetch_reshade, daemon=True).start()
+        # Tk is not thread-safe: the download happens in a thread, and the menu polls
+        # for the result from its own thread.
+        self.root.after(RESHADE_POLL_MS, self._poll_reshade_download)
 
-        def worker():
-            path, error = reshade.download_installer()
-            self.root.after(0, lambda: self._reshade_download_finished(path, error))
+    def _fetch_reshade(self):
+        """Runs in the download thread; never touches the interface."""
+        try:
+            self._reshade_result = reshade.download_installer()
+        except Exception as exc:
+            self._reshade_result = (None, str(exc))
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _poll_reshade_download(self):
+        """Runs in the interface thread until the download result shows up."""
+        result = getattr(self, "_reshade_result", None)
+        if result is None:
+            if not self._closing:
+                self.root.after(RESHADE_POLL_MS, self._poll_reshade_download)
+            return
+        self._reshade_result = None
+        self._reshade_download_finished(*result)
 
     def _reshade_download_finished(self, path, error):
         self.reshade_button.config(state=tk.NORMAL)
