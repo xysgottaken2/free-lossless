@@ -305,7 +305,7 @@ class GameSelectorUI:
         self.selected_detail_label.pack(fill=tk.X, padx=12, pady=(0, 8))
         summary.bind("<Configure>", lambda event: (
             selected_label.config(wraplength=max(180, event.width - 24)),
-            detail_label.config(wraplength=max(180, event.width - 24))))
+            self.selected_detail_label.config(wraplength=max(180, event.width - 24))))
 
     def _section(self, parent, text, row):
         section = tk.Frame(parent, bg=COLORS["panel"])
