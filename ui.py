@@ -2,28 +2,39 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+import i18n
 from selector import WindowSelector, DisplaySelector
 from settings import (
     ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, ENGINE_OPTIONS,
-    HOTKEY_LABELS, HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
+    HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
     MULTIPLIER_MIN, MULTIPLIER_STEP, SCALE_OPTIONS, SettingsStore,
     hotkey_conflicts, normalize_settings, source_identity,
 )
+from theme import COLORS, draw_logo
 
 
-COLORS = {
-    "background": "#0C111B",
-    "panel": "#141D2B",
-    "input": "#1D293B",
-    "border": "#2A3950",
-    "text": "#F1F5FC",
-    "muted": "#9CAEC7",
-    "accent": "#7695FF",
-    "accent_hover": "#92AAFF",
-    "accent_dim": "#293D6B",
-    "success": "#69DDB2",
-    "warning": "#F0BC78",
+def _t(key, **fields):
+    """Translate with the language currently in effect."""
+    return i18n.translate(key, **fields)
+
+
+# Stored values never change; the comboboxes only show translated labels.
+ALGORITHM_HINT_KEYS = {
+    "Bilinear": "algo.hint.bilinear",
+    "Bicubic": "algo.hint.bicubic",
+    "Lanczos": "algo.hint.lanczos",
+    "FSR 1.0 / CAS (Nitidez)": "algo.hint.fsr",
+    "NVIDIA AI SuperRes": "algo.hint.ai",
 }
+ALGORITHM_LABEL_KEYS = {
+    "Bilinear": "algo.bilinear",
+    "Bicubic": "algo.bicubic",
+    "Lanczos": "algo.lanczos",
+    "FSR 1.0 / CAS (Nitidez)": "algo.fsr",
+    "NVIDIA AI SuperRes": "algo.ai",
+}
+MODE_LABEL_KEYS = {"bitblt": "mode.bitblt", "dxcam": "mode.dxcam"}
+ENGINE_LABEL_KEYS = {"AI (RIFE ONNX)": "engine.rife", "Fast (DIS Flow)": "engine.fast"}
 
 
 class GameSelectorUI:
@@ -36,11 +47,14 @@ class GameSelectorUI:
         "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
         "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
         "hotkey_fps": "hotkey_fps_var", "hotkey_fsr": "hotkey_fsr_var",
+        "language": "language_var",
     }
 
     def __init__(self, settings_store=None):
         self.settings_store = settings_store if settings_store is not None else SettingsStore()
         settings = self.settings_store.load()
+        # The saved language decides every string built below.
+        i18n.set_language(settings["language"])
         self.preferred_sources = settings["preferred_sources"]
         self._last_saved_settings = normalize_settings(settings) if not self.settings_store.load_error else None
         self._save_job = None
@@ -50,7 +64,7 @@ class GameSelectorUI:
         self.sources = {}
         self.selector = WindowSelector()
         self.root = tk.Tk()
-        self.root.title("Free Lossless — Controle de overlay")
+        self.root.title(_t("app.window_title"))
         self.root.configure(bg=COLORS["background"])
         # Scale the preferred size with Windows DPI, then fit the available display.
         self._ui_scale = max(1.0, self.root.winfo_fpixels("1i") / 96)
@@ -75,7 +89,7 @@ class GameSelectorUI:
             else:
                 variable_type = tk.StringVar
             setattr(self, name, variable_type(self.root, value=value))
-        self.save_status_var = tk.StringVar(self.root, value="Salvamento automático ativo")
+        self.save_status_var = tk.StringVar(self.root, value=_t("save.autosave_on"))
         self.source_count_var = tk.StringVar(self.root)
         self.selected_title_var = tk.StringVar(self.root)
         self.selected_detail_var = tk.StringVar(self.root)
@@ -86,6 +100,8 @@ class GameSelectorUI:
         self.multiplier_hint_var = tk.StringVar(self.root)
         self.shortcuts_hint_var = tk.StringVar(self.root)
         self._settings_dialog = None
+        # (source variable, display variable, labels) for the translated comboboxes.
+        self._choice_displays = []
 
         self._setup_style()
         self._setup_ui()
@@ -95,7 +111,7 @@ class GameSelectorUI:
             getattr(self, name).trace_add("write", self._on_settings_change)
         self._loading_settings = False
         if self.settings_store.load_error:
-            self._set_save_status("Preferências indisponíveis; usando padrão", COLORS["warning"])
+            self._set_save_status(_t("save.unavailable"), COLORS["warning"])
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Control-Return>", self._on_select)
         self._enable_dark_titlebar()
@@ -204,11 +220,9 @@ class GameSelectorUI:
         header.columnconfigure(1, weight=1)
         logo = tk.Canvas(header, width=44, height=44, bg=COLORS["background"], highlightthickness=0)
         logo.grid(row=0, column=0, rowspan=2, padx=(0, 14))
-        logo.create_rectangle(4, 4, 30, 30, outline=COLORS["accent"], width=2)
-        logo.create_rectangle(14, 14, 40, 40, fill=COLORS["background"], outline=COLORS["success"], width=2)
-        logo.create_line(20, 28, 25, 23, 30, 28, 35, 23, fill=COLORS["success"], width=2)
-        self._label(header, "Free Lossless", size=22, bold=True).grid(row=0, column=1, sticky="w")
-        self._label(header, "Mais fluidez. Sem modificar seu jogo.", muted=True).grid(row=1, column=1, sticky="w")
+        draw_logo(logo, 0, 0, 44)
+        self._label(header, _t("app.title"), size=22, bold=True).grid(row=0, column=1, sticky="w")
+        self._label(header, _t("app.subtitle"), muted=True).grid(row=1, column=1, sticky="w")
         save_area = tk.Frame(header, bg=COLORS["background"])
         save_area.grid(row=0, column=2, rowspan=2, sticky="e", padx=(16, 0))
         self.save_dot = self._label(save_area, "●", size=10)
@@ -216,7 +230,7 @@ class GameSelectorUI:
         self.save_dot.grid(row=0, column=0, padx=(0, 6))
         self._label(save_area, textvariable=self.save_status_var, size=9, wraplength=230,
                     justify=tk.RIGHT).grid(row=0, column=1, sticky="e")
-        self._label(save_area, "Preferências salvas neste dispositivo", muted=True, size=9).grid(
+        self._label(save_area, _t("save.in_this_device"), muted=True, size=9).grid(
             row=1, column=0, columnspan=2, sticky="e", pady=(4, 0))
 
         workspace = tk.Frame(self.root, bg=COLORS["background"])
@@ -233,7 +247,7 @@ class GameSelectorUI:
         settings_card.grid(row=0, column=1, sticky="nsew")
         settings_card.columnconfigure(0, weight=1)
         settings_card.rowconfigure(1, weight=1)
-        self._label(settings_card, "02  /  Ajustes do overlay", size=14, bold=True).grid(
+        self._label(settings_card, _t("settings.section"), size=14, bold=True).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=22, pady=(18, 10))
         self.settings_canvas = tk.Canvas(settings_card, bg=COLORS["panel"], highlightthickness=0,
                                          width=460, yscrollincrement=round(18 * self._ui_scale))
@@ -257,20 +271,21 @@ class GameSelectorUI:
         self._label(footer, textvariable=self.session_summary_var, bold=True).grid(row=0, column=0, sticky="w")
         self._label(footer, textvariable=self.shortcuts_hint_var, muted=True, size=9).grid(
             row=1, column=0, sticky="w", pady=(4, 0))
-        self._button(footer, "⚙  Configurações", self._open_settings_dialog).grid(
+        self._button(footer, _t("action.settings"), self._open_settings_dialog).grid(
             row=0, column=1, rowspan=2, padx=(12, 10))
-        self._button(footer, "Sair", self._on_close).grid(row=0, column=2, rowspan=2, padx=(0, 10))
-        self.start_button = self._button(footer, "Iniciar overlay  →", self._on_select, primary=True)
+        self._button(footer, _t("action.exit"), self._on_close).grid(row=0, column=2, rowspan=2, padx=(0, 10))
+        self.start_button = self._button(footer, _t("action.start"), self._on_select, primary=True)
         self.start_button.grid(row=0, column=3, rowspan=2)
 
     def _setup_source_card(self, card):
         title = tk.Frame(card, bg=COLORS["panel"])
         title.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 12))
-        self._label(title, "01  /  Fonte de captura", size=14, bold=True).pack(anchor="w")
-        self._label(title, "Escolha uma janela ou um monitor.", muted=True, size=9).pack(anchor="w", pady=(4, 0))
+        self._label(title, _t("source.section"), size=14, bold=True).pack(anchor="w")
+        self._label(title, _t("source.hint"), muted=True, size=9).pack(anchor="w", pady=(4, 0))
         segment = tk.Frame(card, bg=COLORS["input"])
         segment.grid(row=1, column=0, sticky="ew", padx=18)
-        for column, (value, label) in enumerate((("window", "Janela / jogo"), ("display", "Monitor"))):
+        for column, (value, label) in enumerate((("window", _t("source.window")),
+                                                 ("display", _t("source.monitor")))):
             segment.columnconfigure(column, weight=1)
             tk.Radiobutton(segment, text=label, value=value, variable=self.source_var, indicatoron=False,
                            command=self._refresh_list, relief=tk.FLAT, bd=0, highlightthickness=1,
@@ -284,7 +299,8 @@ class GameSelectorUI:
         self.list_label = self._label(list_header, size=9, bold=True)
         self.list_label.grid(row=0, column=0, sticky="w")
         self._label(list_header, textvariable=self.source_count_var, muted=True, size=9).grid(row=1, column=0, sticky="w")
-        self._button(list_header, "↻ Atualizar", self._refresh_list).grid(row=0, column=1, rowspan=2, padx=(8, 0))
+        self._button(list_header, _t("source.refresh"), self._refresh_list).grid(
+            row=0, column=1, rowspan=2, padx=(8, 0))
         list_frame = tk.Frame(card, bg=COLORS["panel"])
         list_frame.grid(row=3, column=0, sticky="nsew", padx=18)
         list_frame.columnconfigure(0, weight=1)
@@ -292,8 +308,8 @@ class GameSelectorUI:
         list_frame.rowconfigure(0, weight=1, minsize=round(110 * self._ui_scale))
         self.tree = ttk.Treeview(list_frame, columns=("Title", "Process"), show="headings", selectmode="browse",
                                  height=4, style="App.Treeview")
-        self.tree.heading("Title", text="Título da janela")
-        self.tree.heading("Process", text="Processo")
+        self.tree.heading("Title", text=_t("source.window_title"))
+        self.tree.heading("Process", text=_t("source.process"))
         self.tree.column("Title", width=200, minwidth=100)
         self.tree.column("Process", width=120, minwidth=90)
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview, style="App.Vertical.TScrollbar")
@@ -325,9 +341,23 @@ class GameSelectorUI:
         self._label(section, text, muted=True, size=9, bold=True).grid(row=0, column=0, sticky="w", pady=(0, 12))
         return section
 
+    def _linked_combo(self, parent, source_var, labels, width=18):
+        """Show translated labels while the setting keeps its canonical value."""
+        display_var = tk.StringVar(self.root, value=labels.get(source_var.get(), source_var.get()))
+        combo = self._combo(parent, display_var, (labels[value] for value in labels), width=width)
+        reverse = {label: value for value, label in labels.items()}
+        combo.bind("<<ComboboxSelected>>",
+                   lambda event: source_var.set(reverse.get(display_var.get(), source_var.get())))
+        self._choice_displays.append((source_var, display_var, labels))
+        return combo
+
+    def _sync_choice_displays(self):
+        for source_var, display_var, labels in self._choice_displays:
+            display_var.set(labels.get(source_var.get(), source_var.get()))
+
     def _combo(self, parent, variable, values, width=18):
-        return ttk.Combobox(parent, textvariable=variable, values=values, state="readonly", width=width,
-                            style="App.TCombobox", font=("Segoe UI", 10))
+        return ttk.Combobox(parent, textvariable=variable, values=tuple(values), state="readonly",
+                            width=width, style="App.TCombobox", font=("Segoe UI", 10))
 
     def _slider(self, parent, variable, minimum, maximum, resolution=1):
         return tk.Scale(parent, from_=minimum, to=maximum, variable=variable, orient=tk.HORIZONTAL,
@@ -348,20 +378,23 @@ class GameSelectorUI:
         return switch
 
     def _setup_settings_card(self, parent):
-        capture = self._section(parent, "CAPTURA E SAÍDA", 0)
+        capture = self._section(parent, _t("section.capture_output"), 0)
         fields = tk.Frame(capture, bg=COLORS["panel"])
         fields.grid(row=1, column=0, sticky="ew")
         fields.columnconfigure((0, 1), weight=1, uniform="capture")
-        self._label(fields, "Backend de captura", size=9).grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self._label(fields, "Escala de saída", size=9).grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 6))
-        self.mode_combo = self._combo(fields, self.mode_var, CAPTURE_MODES)
+        self._label(fields, _t("field.capture_backend"), size=9).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._label(fields, _t("field.output_scale"), size=9).grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 6))
+        self.mode_combo = self._linked_combo(
+            fields, self.mode_var, {value: _t(MODE_LABEL_KEYS[value]) for value in CAPTURE_MODES})
         self.mode_combo.grid(row=1, column=0, sticky="ew")
-        self.scale_combo = self._combo(fields, self.scale_var, SCALE_OPTIONS)
+        scale_labels = {value: (value if value != "Fullscreen" else _t("scale.fullscreen"))
+                        for value in SCALE_OPTIONS}
+        self.scale_combo = self._linked_combo(fields, self.scale_var, scale_labels)
         self.scale_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0))
         fps_line = tk.Frame(capture, bg=COLORS["panel"])
         fps_line.grid(row=2, column=0, sticky="ew", pady=(16, 0))
         fps_line.columnconfigure(0, weight=1)
-        self._label(fps_line, "FPS de saída", bold=True).grid(row=0, column=0, sticky="w")
+        self._label(fps_line, _t("field.output_fps"), bold=True).grid(row=0, column=0, sticky="w")
         self._label(fps_line, textvariable=self.fps_value_var, bold=True).grid(row=0, column=1, sticky="e")
         self.fps_scale = self._slider(capture, self.fps_var, 30, 120)
         self.fps_scale.grid(row=3, column=0, sticky="ew", pady=(6, 3))
@@ -375,27 +408,33 @@ class GameSelectorUI:
             button.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0))
             self.fps_presets[value] = button
 
-        image = self._section(parent, "QUALIDADE DA IMAGEM", 1)
-        self._label(image, "Algoritmo de escala / filtro", size=9).grid(row=1, column=0, sticky="w", pady=(0, 6))
-        self.algo_combo = self._combo(image, self.algo_var, ALGORITHM_OPTIONS)
+        image = self._section(parent, _t("section.image_quality"), 1)
+        self._label(image, _t("field.algorithm"), size=9).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        algo_labels = {value: _t(ALGORITHM_LABEL_KEYS[value]) for value in ALGORITHM_OPTIONS}
+        self.algo_combo = self._linked_combo(image, self.algo_var, algo_labels)
         self.algo_combo.grid(row=2, column=0, sticky="ew")
+        self.algo_hint_var = tk.StringVar(self.root)
+        self.algo_hint_label = self._label(image, textvariable=self.algo_hint_var, muted=True,
+                                           size=9, justify=tk.LEFT)
+        self.algo_hint_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
         sharp_line = tk.Frame(image, bg=COLORS["panel"])
-        sharp_line.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        sharp_line.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         sharp_line.columnconfigure(0, weight=1)
-        self._label(sharp_line, "Nitidez", bold=True).grid(row=0, column=0, sticky="w")
+        self._label(sharp_line, _t("field.sharpness"), bold=True).grid(row=0, column=0, sticky="w")
         self._label(sharp_line, textvariable=self.sharp_value_var, bold=True).grid(row=0, column=1, sticky="e")
         self.sharp_scale = self._slider(image, self.sharp_var, 0, 100)
-        self.sharp_scale.grid(row=4, column=0, sticky="ew", pady=(6, 8))
+        self.sharp_scale.grid(row=5, column=0, sticky="ew", pady=(6, 8))
 
-        generation = self._section(parent, "GERAÇÃO DE QUADROS", 2)
-        self.fg_check = self._toggle_row(generation, 1, "Interpolação de quadros",
-                                        "Cria frames intermediários para mais fluidez.", self.fg_var)
-        self.engine_combo = self._combo(generation, self.engine_var, ENGINE_OPTIONS)
+        generation = self._section(parent, _t("section.frame_generation"), 2)
+        self.fg_check = self._toggle_row(generation, 1, _t("toggle.interpolation"),
+                                        _t("toggle.interpolation_hint"), self.fg_var)
+        engine_labels = {value: _t(ENGINE_LABEL_KEYS[value]) for value in ENGINE_OPTIONS}
+        self.engine_combo = self._linked_combo(generation, self.engine_var, engine_labels)
         self.engine_combo.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         multiplier_line = tk.Frame(generation, bg=COLORS["panel"])
         multiplier_line.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         multiplier_line.columnconfigure(0, weight=1)
-        self._label(multiplier_line, "Geração de frames", bold=True).grid(row=0, column=0, sticky="w")
+        self._label(multiplier_line, _t("field.frame_generation"), bold=True).grid(row=0, column=0, sticky="w")
         self._label(multiplier_line, textvariable=self.multiplier_value_var, bold=True).grid(
             row=0, column=1, sticky="e")
         self.multiplier_scale = self._slider(generation, self.multiplier_var, MULTIPLIER_MIN,
@@ -406,10 +445,13 @@ class GameSelectorUI:
         self.multiplier_hint_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
         generation.bind("<Configure>", lambda event: self.multiplier_hint_label.config(
             wraplength=max(200, event.width - 24)))
-        advanced = self._section(parent, "AJUSTES AVANÇADOS", 3)
-        self.ultra_smooth_check = self._toggle_row(advanced, 1, "Ultra Smooth", "Maior precisão na interpolação.", self.ultra_smooth_var)
-        self.perf_mode_check = self._toggle_row(advanced, 2, "Modo de desempenho", "Resolução interna de até 1280 × 720.", self.perf_mode_var)
-        self.low_latency_check = self._toggle_row(advanced, 3, "Baixa latência", "Buffer menor para uma resposta mais rápida.", self.low_latency_var)
+        advanced = self._section(parent, _t("section.advanced"), 3)
+        self.ultra_smooth_check = self._toggle_row(advanced, 1, _t("toggle.ultra_smooth"),
+                                                   _t("toggle.ultra_smooth_hint"), self.ultra_smooth_var)
+        self.perf_mode_check = self._toggle_row(advanced, 2, _t("toggle.performance"),
+                                                _t("toggle.performance_hint"), self.perf_mode_var)
+        self.low_latency_check = self._toggle_row(advanced, 3, _t("toggle.low_latency"),
+                                                  _t("toggle.low_latency_hint"), self.low_latency_var)
 
     def _open_settings_dialog(self):
         """Modal dialog for the global hotkeys and overlay preferences."""
@@ -419,7 +461,7 @@ class GameSelectorUI:
             return
         dialog = tk.Toplevel(self.root)
         self._settings_dialog = dialog
-        dialog.title("Configurações")
+        dialog.title(_t("dialog.title"))
         dialog.configure(bg=COLORS["panel"])
         dialog.transient(self.root)
         dialog.resizable(False, False)
@@ -428,11 +470,11 @@ class GameSelectorUI:
         body = tk.Frame(dialog, bg=COLORS["panel"])
         body.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 8))
         body.columnconfigure(0, weight=1)
-        self._label(body, "Configurações", size=16, bold=True).grid(row=0, column=0, sticky="w")
-        self._label(body, "Atalhos globais e preferências do overlay.", muted=True, size=9).grid(
+        self._label(body, _t("dialog.title"), size=16, bold=True).grid(row=0, column=0, sticky="w")
+        self._label(body, _t("dialog.subtitle"), muted=True, size=9).grid(
             row=1, column=0, sticky="w", pady=(4, 0))
 
-        hotkeys = self._section(body, "ATALHOS GLOBAIS", 2)
+        hotkeys = self._section(body, _t("dialog.hotkeys"), 2)
         fields = tk.Frame(hotkeys, bg=COLORS["panel"])
         fields.grid(row=1, column=0, sticky="ew")
         fields.columnconfigure(1, weight=1)
@@ -440,8 +482,8 @@ class GameSelectorUI:
         for row, key in enumerate(HOTKEY_SETTING_KEYS):
             variable = tk.StringVar(dialog, value=getattr(self, f"{key}_var").get())
             dialog_vars[key] = variable
-            self._label(fields, HOTKEY_LABELS[key], size=9).grid(row=row, column=0, sticky="w",
-                                                                 pady=(0, 8), padx=(0, 14))
+            self._label(fields, _t(f"hotkey.{key.removeprefix('hotkey_')}"), size=9).grid(
+                row=row, column=0, sticky="w", pady=(0, 8), padx=(0, 14))
             combo = self._combo(fields, variable, HOTKEY_OPTIONS, width=6)
             combo.grid(row=row, column=1, sticky="e", pady=(0, 8))
             combo.bind("<<ComboboxSelected>>", lambda event: self._validate_dialog_hotkeys(dialog_vars))
@@ -452,29 +494,39 @@ class GameSelectorUI:
         hotkeys.bind("<Configure>", lambda event: self.dialog_error_label.config(
             wraplength=max(220, event.width - 24)))
 
-        overlay = self._section(body, "OVERLAY", 3)
+        overlay = self._section(body, _t("dialog.overlay"), 3)
         show_fps = tk.BooleanVar(dialog, value=bool(self.show_fps_var.get()))
         dialog_vars["show_fps"] = show_fps
-        self._toggle_row(overlay, 1, "Contador de FPS ao iniciar",
-                         "Mostra o painel de status assim que o overlay abre.", show_fps)
+        self._toggle_row(overlay, 1, _t("toggle.show_fps"), _t("toggle.show_fps_hint"), show_fps)
 
-        preferences = self._section(body, "PREFERÊNCIAS", 4)
-        self._label(preferences, "Arquivo de preferências (salvo automaticamente):", muted=True, size=9).grid(
-            row=1, column=0, sticky="w")
+        preferences = self._section(body, _t("dialog.preferences"), 4)
+        language_line = tk.Frame(preferences, bg=COLORS["panel"])
+        language_line.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        language_line.columnconfigure(1, weight=1)
+        self._label(language_line, _t("dialog.language"), size=9).grid(row=0, column=0, sticky="w",
+                                                                      padx=(0, 14))
+        language = tk.StringVar(dialog, value=i18n.language_name(self.language_var.get()))
+        dialog_vars["language"] = language
+        self.language_combo = self._combo(language_line, language, i18n.LANGUAGE_NAMES.values(), width=22)
+        self.language_combo.grid(row=0, column=1, sticky="e")
+        self._label(preferences, _t("dialog.language_hint"), muted=True, size=9).grid(
+            row=2, column=0, sticky="w", pady=(0, 12))
+        self._label(preferences, _t("dialog.preferences_file"), muted=True, size=9).grid(
+            row=3, column=0, sticky="w")
         self._label(preferences, str(self.settings_store.path), muted=True, size=9,
-                    justify=tk.LEFT).grid(row=2, column=0, sticky="w", pady=(2, 10))
+                    justify=tk.LEFT).grid(row=4, column=0, sticky="w", pady=(2, 10))
         actions = tk.Frame(preferences, bg=COLORS["panel"])
-        actions.grid(row=3, column=0, sticky="w")
-        self._button(actions, "Abrir pasta", self._open_settings_folder).grid(row=0, column=0)
-        self._button(actions, "Restaurar padrões", lambda: self._reset_dialog(dialog_vars)).grid(
+        actions.grid(row=5, column=0, sticky="w")
+        self._button(actions, _t("action.open_folder"), self._open_settings_folder).grid(row=0, column=0)
+        self._button(actions, _t("action.reset"), lambda: self._reset_dialog(dialog_vars)).grid(
             row=0, column=1, padx=(8, 0))
 
         buttons = tk.Frame(dialog, bg=COLORS["panel"])
         buttons.grid(row=1, column=0, sticky="ew", padx=24, pady=(8, 22))
         buttons.columnconfigure(0, weight=1)
-        self._label(buttons, "Esc cancela  ·  Enter salva", muted=True, size=9).grid(row=0, column=0, sticky="w")
-        self._button(buttons, "Cancelar", self._close_settings_dialog).grid(row=0, column=1, padx=(8, 8))
-        self._button(buttons, "Salvar", lambda: self._apply_dialog_settings(dialog_vars),
+        self._label(buttons, _t("dialog.hint_keys"), muted=True, size=9).grid(row=0, column=0, sticky="w")
+        self._button(buttons, _t("action.cancel"), self._close_settings_dialog).grid(row=0, column=1, padx=(8, 8))
+        self._button(buttons, _t("action.save"), lambda: self._apply_dialog_settings(dialog_vars),
                      primary=True).grid(row=0, column=2)
 
         dialog.protocol("WM_DELETE_WINDOW", self._close_settings_dialog)
@@ -497,11 +549,10 @@ class GameSelectorUI:
                    if key in HOTKEY_SETTING_KEYS}
         conflicts = hotkey_conflicts(hotkeys)
         if conflicts:
-            names = ", ".join(sorted({HOTKEY_LABELS[key].split(" (")[0] for key in conflicts}))
-            self.dialog_error_var.set(f"Cada atalho precisa de uma tecla diferente: {names}.")
+            self.dialog_error_var.set(_t("dialog.error_conflict"))
             self.dialog_error_label.config(fg=COLORS["warning"])
             return False
-        self.dialog_error_var.set("Cada atalho usa uma tecla diferente.")
+        self.dialog_error_var.set(_t("dialog.error_ok"))
         self.dialog_error_label.config(fg=COLORS["success"])
         return True
 
@@ -509,6 +560,7 @@ class GameSelectorUI:
         for key in HOTKEY_SETTING_KEYS:
             dialog_vars[key].set(DEFAULT_SETTINGS[key])
         dialog_vars["show_fps"].set(DEFAULT_SETTINGS["show_fps"])
+        dialog_vars["language"].set(i18n.language_name(DEFAULT_SETTINGS["language"]))
         self._validate_dialog_hotkeys(dialog_vars)
 
     def _open_settings_folder(self):
@@ -521,7 +573,7 @@ class GameSelectorUI:
                 import subprocess
                 subprocess.Popen(["xdg-open", str(folder)])
         except Exception as exc:
-            messagebox.showinfo("Pasta de preferências", f"{folder}\n\n{exc}", parent=self.root)
+            messagebox.showinfo(_t("action.open_folder"), f"{folder}\n\n{exc}", parent=self.root)
 
     def _close_settings_dialog(self):
         if self._settings_dialog is not None:
@@ -534,14 +586,34 @@ class GameSelectorUI:
 
     def _apply_dialog_settings(self, dialog_vars):
         if not self._validate_dialog_hotkeys(dialog_vars):
-            messagebox.showwarning("Atalhos repetidos",
-                                   "Escolha uma tecla diferente para cada atalho.", parent=self._settings_dialog)
+            messagebox.showwarning(_t("dialog.conflict_title"),
+                                   _t("dialog.conflict_body"), parent=self._settings_dialog)
             return
         for key in HOTKEY_SETTING_KEYS:
             getattr(self, f"{key}_var").set(dialog_vars[key].get())
         self.show_fps_var.set(bool(dialog_vars["show_fps"].get()))
+        language = i18n.language_code(dialog_vars["language"].get())
+        language_changed = i18n.normalize_language(self.language_var.get()) != language
+        self.language_var.set(language)
         self._close_settings_dialog()
         self._save_settings(notify=True)
+        if language_changed:
+            self._apply_language(language)
+
+    def _apply_language(self, language):
+        """Rebuild the window in the new language without losing any preference."""
+        self._loading_settings = True
+        try:
+            self.language_var.set(i18n.set_language(language))
+            for child in self.root.winfo_children():
+                child.destroy()
+            self._choice_displays = []
+            self._setup_ui()
+            self._refresh_list()
+            self._update_setting_display()
+            self._set_save_status(_t("save.saved"), COLORS["success"])
+        finally:
+            self._loading_settings = False
 
     def _bind_settings_scroll(self, widget):
         widget.bind("<MouseWheel>", self._scroll_settings, add="+")
@@ -609,9 +681,11 @@ class GameSelectorUI:
             self.tree.delete(item)
         self.sources = {}
         is_display = self.source_var.get() == "display"
-        self.list_label.config(text="Monitores detectados" if is_display else "Janelas detectadas")
-        self.tree.heading("Title", text="Monitor" if is_display else "Título da janela")
-        self.tree.heading("Process", text="Resolução / posição" if is_display else "Processo")
+        self.list_label.config(text=_t("source.monitors_detected") if is_display
+                               else _t("source.windows_detected"))
+        self.tree.heading("Title", text=_t("source.monitor") if is_display else _t("source.window_title"))
+        self.tree.heading("Process", text=_t("source.resolution_position") if is_display
+                          else _t("source.process"))
         sources = DisplaySelector.get_displays() if is_display else self.selector.get_visible_windows()
         for index, source in enumerate(sources):
             source = dict(source)
@@ -626,12 +700,13 @@ class GameSelectorUI:
             self.tree.insert("", tk.END, values=(source["title"], detail), iid=iid,
                              tags=("alternate",) if index % 2 else ())
         count = len(self.sources)
-        self.source_count_var.set("1 fonte disponível" if count == 1 else f"{count} fontes disponíveis")
+        self.source_count_var.set(_t("source.count_one") if count == 1
+                                  else _t("source.count_many", count=count))
         if self.sources:
             self.empty_label.place_forget()
         else:
-            self.empty_label.config(text="Nenhum monitor encontrado.\nConecte um monitor e atualize a lista." if is_display
-                                    else "Nenhuma janela encontrada.\nAbra o jogo e atualize a lista.")
+            self.empty_label.config(text=_t("source.empty_monitors") if is_display
+                                    else _t("source.empty_windows"))
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
         remembered = self._find_remembered_source()
         if remembered is not None:
@@ -646,15 +721,15 @@ class GameSelectorUI:
         self.start_button.config(state=tk.NORMAL if source else tk.DISABLED,
                                  bg=COLORS["accent"] if source else COLORS["input"])
         if not source:
-            self.selected_title_var.set("Nenhuma fonte selecionada")
-            self.selected_detail_var.set("Selecione um item na lista para continuar.")
+            self.selected_title_var.set(_t("source.none_selected"))
+            self.selected_detail_var.set(_t("source.select_hint"))
         else:
             title = source["title"]
             self.selected_title_var.set(title if len(title) <= 72 else title[:69] + "…")
             detail = source.get("process")
             if source.get("source_type") == "display":
                 left, top, right, bottom = source["rect"]
-                detail = f"{right - left} × {bottom - top}  ·  Monitor completo"
+                detail = f"{right - left} × {bottom - top}  ·  {_t('source.full_monitor')}"
             self.selected_detail_var.set(detail)
 
     def _update_setting_display(self):
@@ -663,29 +738,28 @@ class GameSelectorUI:
         generation_on = bool(self.fg_var.get())
         self.fps_value_var.set(f"{fps} FPS")
         self.sharp_value_var.set(f"{self.sharp_var.get()}%")
-        self.multiplier_value_var.set(f"x{multiplier}")
+        self.multiplier_value_var.set(_t("multiply.value", multiplier=multiplier))
         for value, button in self.fps_presets.items():
             button.config(bg=COLORS["accent_dim"] if fps == value else COLORS["input"])
         self.engine_combo.configure(state="readonly" if generation_on else "disabled")
         self.multiplier_scale.configure(state=tk.NORMAL if generation_on else tk.DISABLED)
+        self._sync_choice_displays()
+        self.algo_hint_var.set(_t(ALGORITHM_HINT_KEYS.get(self.algo_var.get(), "algo.hint.bicubic")))
         if not generation_on:
-            hint = "Ative a interpolação de quadros para usar a geração de frames."
+            hint = _t("multiply.disabled")
             tone = "muted"
         else:
-            capture_fps = max(1, round(fps / multiplier))
-            hint = (f"{multiplier - 1} frame(s) extra(s) por par  ·  captura a {capture_fps} FPS"
-                    f"  ·  saída a {fps} FPS")
-            if multiplier >= 8:
-                hint += "  ·  pesa mais em GPUs fracas"
+            fields = {"extra": multiplier - 1, "capture": max(1, round(fps / multiplier)), "fps": fps}
+            hint = _t("multiply.warning" if multiplier >= 8 else "multiply.hint", **fields)
             tone = "warning" if multiplier >= 8 else "muted"
         self.multiplier_hint_var.set(hint)
         self.multiplier_hint_label.config(fg=COLORS[tone])
-        self.shortcuts_hint_var.set(
-            f"{self.hotkey_stop_var.get()} menu  ·  {self.hotkey_fps_var.get()} FPS  ·  "
-            f"{self.hotkey_fsr_var.get()} FSR  ·  Ctrl + Enter inicia o overlay")
-        scale = "Tela cheia" if self.scale_var.get() == "Fullscreen" else f"{self.scale_var.get()}×"
-        generation = f"x{multiplier} interpolação" if generation_on else "Somente escala / filtro"
-        self.session_summary_var.set(f"{fps} FPS  ·  {scale}  ·  {generation}")
+        self.shortcuts_hint_var.set(_t("footer.shortcuts", stop=self.hotkey_stop_var.get(),
+                                       fps=self.hotkey_fps_var.get(), fsr=self.hotkey_fsr_var.get()))
+        scale = (_t("footer.fullscreen") if self.scale_var.get() == "Fullscreen"
+                 else f"{self.scale_var.get()}×")
+        self.session_summary_var.set(_t("footer.summary" if generation_on else "footer.summary_off",
+                                        fps=fps, scale=scale, multiplier=multiplier))
 
     def _on_settings_change(self, *args):
         if self._loading_settings or self._closing:
@@ -718,9 +792,9 @@ class GameSelectorUI:
             return
         self._cancel_pending_save()
         if self._collect_settings() == self._last_saved_settings:
-            self._set_save_status("Nenhuma alteração pendente", COLORS["success"])
+            self._set_save_status(_t("save.nothing"), COLORS["success"])
             return
-        self._set_save_status("Salvando preferências…", COLORS["accent"])
+        self._set_save_status(_t("save.saving"), COLORS["accent"])
         self._save_job = self.root.after(self.SAVE_DELAY_MS, self._autosave)
 
     def _autosave(self):
@@ -733,17 +807,16 @@ class GameSelectorUI:
         try:
             self.settings_store.save(settings)
         except OSError as exc:
-            self._set_save_status("Não foi possível salvar", COLORS["warning"])
+            self._set_save_status(_t("save.failed"), COLORS["warning"])
             if notify:
                 messagebox.showwarning(
-                    "Não foi possível salvar as preferências",
-                    "Os ajustes desta sessão podem não ser recuperados ao reabrir o app.\n\n"
-                    f"Verifique a permissão de gravação em:\n{self.settings_store.path}\n\n{exc}",
+                    _t("save.error_title"),
+                    _t("save.error_body", path=self.settings_store.path, error=exc),
                     parent=self.root,
                 )
             return False
         self._last_saved_settings = settings
-        self._set_save_status("Todas as preferências salvas", COLORS["success"])
+        self._set_save_status(_t("save.saved"), COLORS["success"])
         return True
 
     def _close_root(self):
@@ -764,11 +837,13 @@ class GameSelectorUI:
             return "break"
         source = self._remember_selected_source()
         if not source:
-            messagebox.showinfo("Selecione uma fonte", "Selecione uma janela ou um monitor na lista.", parent=self.root)
+            messagebox.showinfo(_t("msg.select_source_title"), _t("msg.select_source_body"),
+                                parent=self.root)
             return "break"
         settings = self._collect_settings()
         self.selected_source = {**source, **{key: value for key, value in settings.items()
                                           if key not in ("version", "preferred_sources", "source_type")}}
+        self.selected_source["language"] = i18n.get_language()
         # Flush the debounce before destroying Tk or initializing overlay/GPU resources.
         self._save_settings(notify=True)
         self._close_root()
@@ -780,6 +855,6 @@ class GameSelectorUI:
 
 
 if __name__ == "__main__":
-    ui = GameSelectorUI()
+    ui = GameSelectorUI()  # noqa: F841 - manual smoke run
     selection = ui.get_selection()
     print(f"User selected: {selection}")

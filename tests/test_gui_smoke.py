@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock
 
+import i18n
 from helpers import load_module, stubs
 from settings import HOTKEY_OPTIONS, SettingsStore, normalize_settings
 
@@ -23,6 +24,8 @@ class RealTkSmokeTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.store = SettingsStore(Path(directory.name) / "settings.json")
+        i18n.set_language("en")
+        self.addCleanup(i18n.set_language, "en")
         self.dependencies = stubs("selector")
         self.dependencies["selector"].WindowSelector.return_value.get_visible_windows.return_value = [
             {"hwnd": 42, "title": "Game", "process": "game.exe"},
@@ -133,7 +136,7 @@ class RealTkSmokeTests(unittest.TestCase):
         saved = self.store.load()
         self.assertEqual(saved["fps"], 120)
         self.assertFalse(saved["low_latency"])
-        self.assertEqual(ui.save_status_var.get(), "Todas as preferências salvas")
+        self.assertEqual(ui.save_status_var.get(), "All preferences saved")
 
     def test_source_only_change_autosaves_and_reopens_with_new_handle(self):
         ui = self.make_ui()
@@ -158,7 +161,7 @@ class RealTkSmokeTests(unittest.TestCase):
         ui.multiplier_var.set(20)
         ui.root.update()
         self.assertEqual(ui.multiplier_value_var.get(), "x20")
-        self.assertIn("19 frame(s) extra(s)", ui.multiplier_hint_var.get())
+        self.assertIn("19 extra frame(s)", ui.multiplier_hint_var.get())
         self.run_pending_save(ui)
         self.assertEqual(self.store.load()["frame_multiplier"], 20)
         ui.tree.selection_set("0")
@@ -173,12 +176,12 @@ class RealTkSmokeTests(unittest.TestCase):
         dialog = ui._settings_dialog
         self.assertIsNotNone(dialog)
         combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
-        self.assertEqual([list(combo.cget("values")) for combo in combos],
-                         [list(HOTKEY_OPTIONS)] * 3)
-        combos[0].set("F5")
-        combos[1].set("F6")
-        combos[2].set("F7")
-        self.find(dialog, tk.Button, "Salvar").invoke()
+        hotkey_combos = [combo for combo in combos if list(combo.cget("values")) == list(HOTKEY_OPTIONS)]
+        self.assertEqual(len(hotkey_combos), 3)
+        hotkey_combos[0].set("F5")
+        hotkey_combos[1].set("F6")
+        hotkey_combos[2].set("F7")
+        self.find(dialog, tk.Button, "Save").invoke()
         self.assertIsNone(ui._settings_dialog)
         ui.root.update()
         saved = self.store.load()
@@ -195,14 +198,16 @@ class RealTkSmokeTests(unittest.TestCase):
         ui._open_settings_dialog()
         dialog = ui._settings_dialog
         combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
-        combos[1].set("F11")  # already used to stop the overlay
-        self.find(dialog, tk.Button, "Salvar").invoke()
+        hotkey_combos = [combo for combo in combos if list(combo.cget("values")) == list(HOTKEY_OPTIONS)]
+        hotkey_combos[1].set("F11")  # already used to stop the overlay
+        self.find(dialog, tk.Button, "Save").invoke()
         ui.root.update()
         self.assertIsNotNone(ui._settings_dialog)  # the dialog stays open for a fix
         self.module.messagebox.showwarning.assert_called_once()
         self.assertEqual(ui.hotkey_fps_var.get(), "F10")
-        combos[1].set("F6")
-        self.find(dialog, tk.Button, "Cancelar").invoke()
+        hotkey_combos = [combo for combo in combos if list(combo.cget("values")) == list(HOTKEY_OPTIONS)]
+        hotkey_combos[1].set("F6")
+        self.find(dialog, tk.Button, "Cancel").invoke()
         self.assertIsNone(ui._settings_dialog)
         self.assertEqual(self.store.load()["hotkey_fps"], "F10")
         self.assertEqual(ui.hotkey_fps_var.get(), "F10")
@@ -212,12 +217,40 @@ class RealTkSmokeTests(unittest.TestCase):
         ui._open_settings_dialog()
         dialog = ui._settings_dialog
         combos = [widget for widget in self.widgets(dialog) if isinstance(widget, ttk.Combobox)]
-        combos[0].set("F2")
-        self.find(dialog, tk.Button, "Restaurar padrões").invoke()
+        hotkey_combos = [combo for combo in combos if list(combo.cget("values")) == list(HOTKEY_OPTIONS)]
+        hotkey_combos[0].set("F2")
+        self.find(dialog, tk.Button, "Restore defaults").invoke()
         ui.root.update()
-        self.assertEqual([combo.get() for combo in combos], ["F11", "F10", "F9"])
-        self.find(dialog, tk.Button, "Salvar").invoke()
+        self.assertEqual([combo.get() for combo in hotkey_combos], ["F11", "F10", "F9"])
+        self.find(dialog, tk.Button, "Save").invoke()
         self.assertEqual(self.store.load()["hotkey_stop"], "F11")
+
+    def test_language_picker_switches_the_whole_menu_and_survives_a_restart(self):
+        ui = self.make_ui()
+        self.assertIn("More fluidity", self.header_subtitle(ui).cget("text"))
+        ui._open_settings_dialog()
+        dialog = ui._settings_dialog
+        language_combo = next(combo for combo in self.widgets(dialog)
+                              if isinstance(combo, ttk.Combobox)
+                              and "Português (Brasil)" in list(combo.cget("values")))
+        language_combo.set("Português (Brasil)")
+        self.find(dialog, tk.Button, "Save").invoke()
+        ui.root.update()
+        self.assertEqual(self.store.load()["language"], "pt-BR")
+        self.assertIn("Mais fluidez", self.header_subtitle(ui).cget("text"))
+        # Switching back rebuilds the window again and keeps every other preference.
+        reopened = self.make_ui()
+        self.assertEqual(reopened.language_var.get(), "pt-BR")
+        self.assertIn("Mais fluidez", self.header_subtitle(reopened).cget("text"))
+
+    def header_subtitle(self, ui):
+        for widget in self.widgets(ui.root):
+            if isinstance(widget, tk.Label) and widget.cget("text") in (
+                    "More fluidity. Without modifying your game.",
+                    "Mais fluidez. Sem modificar seu jogo.",
+                    "更流畅，无需修改游戏。"):
+                return widget
+        raise AssertionError("subtitle not found")
 
     def test_small_window_keeps_start_visible_and_advanced_controls_scrollable(self):
         ui = self.make_ui()

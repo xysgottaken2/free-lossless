@@ -226,7 +226,7 @@ class RIFEONNXEngine:
             # Post-process: (1, C, H, W) -> (H, W, C) [0, 255]
             res = (np.clip(output[0].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
             return res
-        except Exception as e:
+        except Exception:
             # Fallback if names are slightly different or model varies
             try:
                 # Dynamic mapping if names changed

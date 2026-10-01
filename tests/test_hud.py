@@ -2,6 +2,7 @@ import types
 import unittest
 from unittest.mock import MagicMock
 
+import i18n
 from helpers import load_module, stubs
 
 
@@ -50,6 +51,8 @@ class FakeDraw:
 
 class OverlayHudTests(unittest.TestCase):
     def setUp(self):
+        i18n.set_language("en")
+        self.addCleanup(i18n.set_language, "en")
         self.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
                           "filters", "win32gui", "win32api", "win32con", "tkinter")
         self.module = load_module("main", self.deps)
@@ -62,6 +65,7 @@ class OverlayHudTests(unittest.TestCase):
         app.fsr_mode = state.get("fsr_mode", False)
         app.ai_mode = state.get("ai_mode", True)
         app.ultra_smooth = state.get("ultra_smooth", False)
+        app.live_fallback = state.get("live_fallback", False)
         app.hotkey_names = dict(self.module.DEFAULT_HOTKEY_NAMES)
         return app
 
@@ -72,13 +76,25 @@ class OverlayHudTests(unittest.TestCase):
 
     def test_chips_reflect_the_selected_modes(self):
         self.assertEqual(self.module.hud_chips(True, True, True),
-                         [("FSR", "ON", "on"), ("AI", "ON", "on"), ("MODO", "SMOOTH", "mode")])
+                         [("FSR", "ON", "on"), ("AI", "ON", "on"), ("MODE", "SMOOTH", "mode"),
+                          ("", "FG", "on")])
         self.assertEqual(self.module.hud_chips(False, False, False),
-                         [("FSR", "OFF", "off"), ("AI", "OFF", "off"), ("MODO", "PADRÃO", "off")])
+                         [("FSR", "OFF", "off"), ("AI", "OFF", "off"), ("MODE", "STD", "off"),
+                          ("", "FG", "on")])
+
+    def test_chips_say_when_frames_come_straight_from_the_capture(self):
+        chips = self.module.hud_chips(False, False, False, live=True)
+        self.assertEqual(chips[-1], ("", "LIVE", "mode"))
+
+    def test_chips_follow_the_selected_language(self):
+        i18n.set_language("pt-BR")
+        self.assertEqual(self.module.hud_chips(True, False, True)[2], ("MODO", "SMOOTH", "mode"))
+        i18n.set_language("zh-CN")
+        self.assertEqual(self.module.hud_chips(False, False, False)[2], ("模式", "标准", "off"))
 
     def test_panel_and_every_label_stay_inside_the_overlay(self):
         screen = self.draw_hud(self.make_app())
-        self.assertEqual(len(screen.blits), 10)  # panel, fps value+label, 3 chips + 3 texts, hint
+        self.assertEqual(len(screen.blits), 12)  # panel, fps value+label, 4 chips + 4 texts, hint
         for size, (x, y) in screen.blits:
             self.assertGreaterEqual(x, 0)
             self.assertGreaterEqual(y, 0)
@@ -91,9 +107,9 @@ class OverlayHudTests(unittest.TestCase):
         self.assertEqual(panel_position, (16, 16))
         self.assertEqual(panel_size, self.draw.rects[0]["rect"][2:])
         self.assertEqual(self.draw.rects[0]["border_radius"], 12)
-        self.assertEqual(len(self.draw.rects), 4)  # panel outline plus one per chip
+        self.assertEqual(len(self.draw.rects), 5)  # panel outline plus one per chip
         self.assertTrue(all(entry["border_radius"] for entry in self.draw.rects))
-        self.assertEqual([entry["width"] for entry in self.draw.rects], [1, 1, 1, 1])
+        self.assertEqual([entry["width"] for entry in self.draw.rects], [1, 1, 1, 1, 1])
 
     def test_panel_grows_with_the_content_and_fits_a_small_window(self):
         small = self.draw_hud(self.make_app(ultra_smooth=False), size=(320, 200))
@@ -103,7 +119,7 @@ class OverlayHudTests(unittest.TestCase):
         self.assertEqual(small.blits[0][1], (16, 16))
         # Chips are laid out left to right without overlapping or leaving the panel.
         chip_rects = [entry["rect"] for entry in self.draw.rects[1:]]
-        self.assertEqual(len(chip_rects), 3)
+        self.assertEqual(len(chip_rects), 4)
         for previous, following in zip(chip_rects, chip_rects[1:]):
             self.assertLessEqual(previous[0] + previous[2], following[0])
         self.assertLessEqual(chip_rects[-1][0] + chip_rects[-1][2], 16 + panel[0])

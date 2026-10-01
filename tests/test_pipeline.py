@@ -107,7 +107,8 @@ class ProcessingSubroutineTests(unittest.TestCase):
                   "frame_multiplier": multiplier, "internal_res": (800, 600)}
         self.module.processing_subroutine(FakeCaptureQueue(self.frames), self.process_queue, config,
                                           FakeStopEvent(len(self.frames)))
-        return [call.args[0] for call in self.process_queue.put.call_args_list]
+        # Frames reach the display through put_nowait so a full queue drops the oldest.
+        return [call.args[0] for call in self.process_queue.put_nowait.call_args_list]
 
     def test_multiplier_defines_how_many_frames_each_pair_becomes(self):
         queued = self.run_worker(2)
@@ -140,7 +141,7 @@ class SelectionSettingsTests(unittest.TestCase):
     def setUp(self):
         self.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
                           "filters", "win32gui", "win32api", "win32con", "tkinter")
-        self.module = load_module("main", self.deps)
+        self.module = load_module("main", self.deps, runtime=True)
         self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
         self.source = {"source_type": "window", "hwnd": 7, "title": "Game", "mode": "bitblt",
                        "fps": 120, "scale": "1.0", "algo": "Lanczos", "sharpness": 20,

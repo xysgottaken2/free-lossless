@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, call
 
+import i18n
 from helpers import load_module, stubs
 from settings import normalize_settings
 
@@ -20,12 +21,16 @@ class FakeVar:
 
 class SelectionUITests(unittest.TestCase):
     def setUp(self):
+        i18n.set_language("en")
+        self.addCleanup(i18n.set_language, "en")
         self.deps = stubs("tkinter", "tkinter.ttk", "tkinter.messagebox", "selector")
         self.module = load_module("ui", self.deps)
         self.ui = self.module.GameSelectorUI.__new__(self.module.GameSelectorUI)
+        self.ui._choice_displays = []
         for name in ("root", "tree", "list_label", "selector", "source_count_var", "empty_label",
                      "start_button", "selected_title_var", "selected_detail_var", "save_status_var", "save_dot",
-                     "settings_store", "fps_value_var", "sharp_value_var", "engine_combo", "session_summary_var"):
+                     "settings_store", "fps_value_var", "sharp_value_var", "engine_combo", "session_summary_var",
+                     "algo_hint_var"):
             setattr(self.ui, name, MagicMock())
         self.ui.tree.get_children.return_value = ["stale-window"]
         self.ui.tree.selection.return_value = []
@@ -133,13 +138,13 @@ class SelectionUITests(unittest.TestCase):
         self.ui._schedule_save()
         self.ui.root.after_cancel.assert_called_once_with("pending-save")
         self.ui.root.after.assert_not_called()
-        self.ui.save_status_var.set.assert_called_with("Nenhuma alteração pendente")
+        self.ui.save_status_var.set.assert_called_with("No pending changes")
 
     def test_save_failure_warns_but_does_not_prevent_closing(self):
         self.ui.settings_store.save.side_effect = PermissionError("read-only directory")
         self.ui._on_close()
         self.module.messagebox.showwarning.assert_called_once()
-        self.ui.save_status_var.set.assert_called_with("Não foi possível salvar")
+        self.ui.save_status_var.set.assert_called_with("Could not save")
         self.ui.root.destroy.assert_called_once()
 
     def test_background_save_failure_does_not_open_repeated_dialogs(self):
@@ -147,7 +152,7 @@ class SelectionUITests(unittest.TestCase):
         self.ui._autosave()
         self.module.messagebox.showwarning.assert_not_called()
         self.ui.root.destroy.assert_not_called()
-        self.ui.save_status_var.set.assert_called_with("Não foi possível salvar")
+        self.ui.save_status_var.set.assert_called_with("Could not save")
 
     def test_refresh_restores_source_using_new_handle(self):
         self.ui.preferred_sources = {"window": {"title": "Game", "process": "game.exe"}}
@@ -197,17 +202,17 @@ class SelectionUITests(unittest.TestCase):
         self.ui._update_setting_display()
         self.ui.multiplier_value_var.set.assert_called_with("x6")
         hint = self.ui.multiplier_hint_var.set.call_args.args[0]
-        self.assertIn("5 frame(s) extra(s)", hint)
-        self.assertIn("captura a 15 FPS", hint)
-        self.assertIn("saída a 90 FPS", hint)
+        self.assertIn("5 extra frame(s)", hint)
+        self.assertIn("capture at 15 FPS", hint)
+        self.assertIn("output at 90 FPS", hint)
         self.ui.multiplier_hint_label.config.assert_called_with(fg=self.module.COLORS["muted"])
 
     def test_high_multipliers_warn_about_the_cost(self):
         self.ui.multiplier_var.value = 20
         self.ui._update_setting_display()
         hint = self.ui.multiplier_hint_var.set.call_args.args[0]
-        self.assertIn("19 frame(s) extra(s)", hint)
-        self.assertIn("captura a 4 FPS", hint)
+        self.assertIn("19 extra frame(s)", hint)
+        self.assertIn("capture at 4 FPS", hint)
         self.assertIn("GPU", hint)
         self.ui.multiplier_hint_label.config.assert_called_with(fg=self.module.COLORS["warning"])
 
@@ -215,7 +220,7 @@ class SelectionUITests(unittest.TestCase):
         self.ui.fg_var.value = False
         self.ui._update_setting_display()
         self.ui.multiplier_scale.configure.assert_called_with(state=self.module.tk.DISABLED)
-        self.assertIn("Ative a interpolação", self.ui.multiplier_hint_var.set.call_args.args[0])
+        self.assertIn("Enable frame interpolation", self.ui.multiplier_hint_var.set.call_args.args[0])
         self.ui.fg_var.value = True
         self.ui._update_setting_display()
         self.ui.multiplier_scale.configure.assert_called_with(state=self.module.tk.NORMAL)
@@ -226,20 +231,21 @@ class SelectionUITests(unittest.TestCase):
         self.ui.hotkey_fps_var.value = "F3"
         self.ui.hotkey_fsr_var.value = "F4"
         self.ui._update_setting_display()
-        self.assertIn("x4 interpolação", self.ui.session_summary_var.set.call_args.args[0])
+        self.assertIn("x4 interpolation", self.ui.session_summary_var.set.call_args.args[0])
         self.assertEqual(self.ui.shortcuts_hint_var.set.call_args.args[0],
-                         "F2 menu  ·  F3 FPS  ·  F4 FSR  ·  Ctrl + Enter inicia o overlay")
+                         "F2 menu  ·  F3 FPS  ·  F4 FSR  ·  Ctrl + Enter starts the overlay")
 
-    def make_dialog_vars(self, stop="F11", fps="F10", fsr="F9", show_fps=True):
+    def make_dialog_vars(self, stop="F11", fps="F10", fsr="F9", show_fps=True, language="English (US)"):
         return {"hotkey_stop": FakeVar(stop), "hotkey_fps": FakeVar(fps),
-                "hotkey_fsr": FakeVar(fsr), "show_fps": FakeVar(show_fps)}
+                "hotkey_fsr": FakeVar(fsr), "show_fps": FakeVar(show_fps),
+                "language": FakeVar(language)}
 
     def test_dialog_hotkey_validation_flags_repeated_keys(self):
         self.assertTrue(self.ui._validate_dialog_hotkeys(self.make_dialog_vars()))
-        self.assertIn("diferente", self.ui.dialog_error_var.set.call_args.args[0])
+        self.assertIn("its own key", self.ui.dialog_error_var.set.call_args.args[0])
         self.assertFalse(self.ui._validate_dialog_hotkeys(self.make_dialog_vars(fsr="F11")))
         message = self.ui.dialog_error_var.set.call_args.args[0]
-        self.assertIn("tecla diferente", message)
+        self.assertIn("different key", message)
         self.ui.dialog_error_label.config.assert_called_with(fg=self.module.COLORS["warning"])
 
     def test_applying_the_dialog_updates_settings_saves_and_closes(self):
@@ -269,6 +275,47 @@ class SelectionUITests(unittest.TestCase):
         self.assertEqual(variables["hotkey_fps"].value, "F10")
         self.assertEqual(variables["hotkey_fsr"].value, "F9")
         self.assertTrue(variables["show_fps"].value)
+        self.assertEqual(variables["language"].value, "English (US)")
+
+    def test_stored_language_is_saved_and_kept_in_the_selection(self):
+        self.ui.language_var = FakeVar("pt-BR")
+        self.assertEqual(self.ui._collect_settings()["language"], "pt-BR")
+
+    def test_switching_language_rebuilds_the_menu_and_keeps_the_preferences(self):
+        self.ui.language_var = FakeVar("en")
+        self.ui._setup_ui = MagicMock()
+        self.ui._refresh_list = MagicMock()
+        self.ui._update_setting_display = MagicMock()
+        self.ui._set_save_status = MagicMock()
+        self.ui._apply_language("pt-BR")
+        self.assertEqual(i18n.get_language(), "pt-BR")
+        self.assertEqual(self.ui.language_var.value, "pt-BR")
+        self.ui._setup_ui.assert_called_once()
+        self.ui._refresh_list.assert_called_once()
+        self.ui._update_setting_display.assert_called_once()
+        self.assertTrue(self.ui._loading_settings is False)
+
+    def test_dialog_language_choice_is_applied_and_persisted(self):
+        self.ui._close_settings_dialog = MagicMock()
+        self.ui._save_settings = MagicMock(return_value=True)
+        self.ui._setup_ui = MagicMock()
+        self.ui._refresh_list = MagicMock()
+        self.ui._update_setting_display = MagicMock()
+        self.ui._set_save_status = MagicMock()
+        self.ui.language_var = FakeVar("en")
+        self.ui._apply_dialog_settings(self.make_dialog_vars(language="简体中文"))
+        self.assertEqual(self.ui.language_var.value, "zh-CN")
+        self.assertEqual(i18n.get_language(), "zh-CN")
+        self.ui._save_settings.assert_called_once_with(notify=True)
+        self.ui._setup_ui.assert_called_once()
+
+    def test_saving_without_changing_the_language_does_not_rebuild_the_window(self):
+        self.ui._close_settings_dialog = MagicMock()
+        self.ui._save_settings = MagicMock(return_value=True)
+        self.ui._setup_ui = MagicMock()
+        self.ui.language_var = FakeVar("en")
+        self.ui._apply_dialog_settings(self.make_dialog_vars(language="English (US)"))
+        self.ui._setup_ui.assert_not_called()
 
     def test_keyboard_focus_scrolls_hidden_advanced_controls_into_view(self):
         self.ui._ui_scale = 1.0

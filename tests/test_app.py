@@ -8,7 +8,8 @@ class AppSourceTests(unittest.TestCase):
     def setUp(self):
         self.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
                           "filters", "win32gui", "win32api", "win32con", "tkinter")
-        self.module = load_module("main", self.deps)
+        # The overlay modules are imported lazily (the splash covers that time).
+        self.module = load_module("main", self.deps, runtime=True)
         self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
         self.source = {
             "source_type": "display", "device": r"\\.\DISPLAY2", "title": "Display 2",

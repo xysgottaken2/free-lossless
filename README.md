@@ -56,7 +56,8 @@ ajustes do overlay. Há atalhos de FPS, controles de ativação e uma área de a
 com rolagem para manter todas as opções acessíveis em telas menores.
 
 - O painel de status do overlay (atalho de FPS) também foi modernizado: FPS em
-  destaque, etiquetas de estado para FSR, AI e modo, e a dica do atalho de parada. O
+  destaque, etiquetas de estado para FSR, AI, modo e a origem do frame (`FG` para
+  frames gerados, `LIVE` para captura direta), e a dica do atalho de parada. O
   conteúdo é renderizado apenas quando o status muda, para não pesar no frame.
 - **Geração de frames (x2 a x20)**: o slider define quantos frames cada par capturado
   se torna — x2 (padrão) gera 1 frame intermediário por par, x4 gera 3, x6 gera 5 e
@@ -73,8 +74,8 @@ com rolagem para manter todas as opções acessíveis em telas menores.
   sem precisar de um botão de confirmação.
 - Ao voltar ao menu (atalho de parada) ou reabrir o app, são restaurados o tipo de
   fonte, backend, FPS, escala, algoritmo, nitidez, multiplicador da geração de
-  quadros, motor, Ultra Smooth, modo de desempenho, baixa latência, atalhos e a
-  preferência do contador de FPS.
+  quadros, motor, Ultra Smooth, modo de desempenho, baixa latência, atalhos, idioma
+  e a preferência do contador de FPS.
 - A última janela e o último monitor selecionados também são lembrados. A seleção
   só é restaurada quando a fonte está disponível: monitores são identificados pelo
   dispositivo e janelas pelo título/processo. Se o título mudar, o processo só é
@@ -91,6 +92,50 @@ para Windows.
 A gravação é atômica para preservar o último arquivo em caso de falha. Se o arquivo
 estiver inválido ou ilegível, o menu abre com os padrões e mostra um aviso no status.
 Se não for possível salvar, o app informa o erro em vez de fechar inesperadamente.
+
+## Idioma da interface
+
+O app fala **inglês (padrão na primeira execução)**, **português do Brasil** e
+**chinês simplificado**. A troca é feita em **Configurações → PREFERÊNCIAS → Idioma**
+e vale imediatamente após salvar: o menu, o diálogo, o painel do overlay, as
+mensagens de erro e até a tela de abertura passam a usar o idioma escolhido. A
+escolha fica gravada junto das outras preferências (`language` no `settings.json`).
+
+## Tela de abertura (splash)
+
+Ao iniciar, aparece uma janela sem bordas, na mesma cor de fundo do app, com o logo,
+o nome **Free Lossless** e a assinatura *"Mais fluidez. Sem modificar seu jogo."* Ela
+fica visível por alguns segundos enquanto o OpenCV, o NumPy, o Pygame e o DXCAM são
+carregados — no executável isso leva segundos — e se fecha sozinha assim que o menu
+está pronto. A janela não bloqueia nada: o carregamento acontece em segundo plano e a
+barra de progresso continua animada mesmo em máquinas lentas (uma dica aparece se
+demorar mais que o normal).
+
+## Desempenho do overlay
+
+O gargalo do overlay era o pós-processamento na resolução cheia do monitor, a cada
+frame, além de cópias desnecessárias na captura:
+
+| Etapa (1080p) | Antes | Agora |
+| --- | --- | --- |
+| CAS / nitidez adaptativa | ~95 ms | ~2-6 ms (na resolução interna) |
+| Caminho FSR completo | ~127 ms | ~8-14 ms (nitidez + bicúbico) |
+| Nitidez simples | ~11 ms | ~3-5 ms (na resolução interna) |
+| Conversão BGRA→RGB (BitBlt) | ~11 ms | ~0,3 ms (`cv2.cvtColor`) |
+| Upscale Lanczos | ~22 ms | bicúbico, ~2 ms |
+
+Além disso:
+
+- A nitidez e o CAS acontecem **antes** do upscale, na resolução interna (800×600 ou
+  1280×720 no modo de desempenho). Fazer o mesmo trabalho na resolução da tela custa
+  10 a 20 vezes mais por frame.
+- As filas descartam o frame **mais antigo** quando enchem, em vez de travar a
+  captura: o overlay mostra sempre o frame mais recente disponível.
+- Se a pipeline atrasar (por exemplo, um multiplicador alto numa GPU fraca), o painel
+  passa a exibir a captura direta e marca `LIVE` em vez de congelar na imagem antiga.
+- O contador de FPS é medido de verdade, numa janela de meio segundo: se a pipeline
+  não acompanhar, o número cai em vez de mentir.
+- O processo do overlay roda com prioridade alta, e o worker de interpolação também.
 
 ## Setup Guide (developers / running from source)
 

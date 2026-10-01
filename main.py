@@ -1,23 +1,62 @@
-import cv2
-import numpy as np
-import pygame
-import threading
-import time
 import ctypes
 import multiprocessing
-from queue import Queue, Full
-from capture import ScreenCapture
-from engine import RIFEEngine, RIFEONNXEngine
-from ui import GameSelectorUI
-from selector import get_source_rect, get_source_monitor_rect
-from tkinter import messagebox
-from filters import AMDFilters, NvidiaAIUpscaler
-from settings import (DEFAULT_HOTKEYS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
-                      MULTIPLIER_MIN, MULTIPLIER_STEP)
-import win32gui
-import win32con
-import win32api
 import os
+import threading
+import time
+from queue import Empty, Full, Queue
+
+try:  # Tk is only needed for the error dialog, and it is missing on some Linux boxes.
+    from tkinter import messagebox
+except ImportError:  # pragma: no cover - the Windows build always ships Tk
+    messagebox = None
+
+import i18n
+from settings import (DEFAULT_HOTKEYS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
+                      MULTIPLIER_MIN, MULTIPLIER_STEP, SettingsStore)
+from splash import run_splash
+
+# The heavy modules (OpenCV, numpy, pygame, DXCAM, pywin32) take seconds to import
+# in the frozen build, so they are loaded by load_runtime() right after the splash
+# appears. Everything below reads them through these module globals.
+cv2 = np = pygame = None
+ScreenCapture = None
+RIFEEngine = RIFEONNXEngine = None
+GameSelectorUI = None
+get_source_rect = get_source_monitor_rect = None
+AMDFilters = NvidiaAIUpscaler = None
+win32gui = win32con = win32api = None
+
+
+def runtime_loaded():
+    return pygame is not None
+
+
+def load_runtime():
+    """Import the overlay dependencies. Calling it twice is harmless."""
+    global cv2, np, pygame, ScreenCapture, RIFEEngine, RIFEONNXEngine, GameSelectorUI
+    global get_source_rect, get_source_monitor_rect, AMDFilters, NvidiaAIUpscaler
+    global win32gui, win32con, win32api
+    if runtime_loaded():
+        return
+    import cv2 as cv2_module
+    import numpy as numpy_module
+    import pygame as pygame_module
+    import win32api as win32api_module
+    import win32con as win32con_module
+    import win32gui as win32gui_module
+    from capture import ScreenCapture as capture_class
+    from engine import RIFEEngine as fast_engine, RIFEONNXEngine as ai_engine
+    from filters import AMDFilters as amd_filters, NvidiaAIUpscaler as nvidia_upscaler
+    from selector import (get_source_monitor_rect as monitor_rect_function,
+                          get_source_rect as source_rect_function)
+    from ui import GameSelectorUI as selector_ui
+    cv2, np, pygame = cv2_module, numpy_module, pygame_module
+    win32api, win32con, win32gui = win32api_module, win32con_module, win32gui_module
+    ScreenCapture = capture_class
+    RIFEEngine, RIFEONNXEngine = fast_engine, ai_engine
+    AMDFilters, NvidiaAIUpscaler = amd_filters, nvidia_upscaler
+    get_source_rect, get_source_monitor_rect = source_rect_function, monitor_rect_function
+    GameSelectorUI = selector_ui
 
 # Fallbacks keep the overlay usable if a saved hotkey is missing or invalid.
 DEFAULT_HOTKEY_VK = {"stop": 0x7A, "fps": 0x79, "fsr": 0x78}
@@ -41,6 +80,27 @@ def capture_interval(target_fps, multiplier):
         multiplier = 2
     rate = (target_fps / multiplier) if target_fps and target_fps > 0 else (30.0 / multiplier)
     return 1.0 / rate if rate > 0 else 1.0
+
+
+def put_latest(target_queue, item):
+    """Queue a frame for a real-time consumer, dropping the oldest when full.
+
+    Waiting for space would add lag instead of dropping frames nobody will see.
+    """
+    try:
+        target_queue.put_nowait(item)
+        return True
+    except Full:
+        pass
+    try:
+        target_queue.get_nowait()
+    except Empty:
+        pass
+    try:
+        target_queue.put_nowait(item)
+        return True
+    except Full:
+        return False
 
 
 def queue_sizes(multiplier, low_latency=True):
@@ -96,12 +156,19 @@ HUD_GAP = 8
 HUD_CHIP_PADDING = 16
 
 
-def hud_chips(fsr_on, ai_on, ultra_smooth):
-    """Status chips for the overlay panel, as (label, value, color key)."""
+def hud_chips(fsr_on, ai_on, ultra_smooth, live=False):
+    """Status chips for the overlay panel, as (label, value, color key).
+
+    ``live`` marks frames that came straight from the capture because the pipeline
+    could not keep up, so the panel says where the image is coming from.
+    """
+    mode = i18n.translate("hud.smooth") if ultra_smooth else i18n.translate("hud.standard")
     return [
         ("FSR", "ON" if fsr_on else "OFF", "on" if fsr_on else "off"),
         ("AI", "ON" if ai_on else "OFF", "on" if ai_on else "off"),
-        ("MODO", "SMOOTH" if ultra_smooth else "PADRÃO", "mode" if ultra_smooth else "off"),
+        (i18n.translate("hud.mode"), mode, "mode" if ultra_smooth else "off"),
+        ("", i18n.translate("hud.live") if live else i18n.translate("hud.generated"),
+         "mode" if live else "on"),
     ]
 
 
@@ -111,8 +178,13 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
     """
     from engine import RIFEEngine, RIFEONNXEngine
     import cv2
-    import numpy as np
-    
+    # The overlay must win over background work while a game is running.
+    try:
+        import psutil
+        psutil.Process().nice(psutil.HIGH_PRIORITY_CLASS)
+    except Exception:
+        pass
+
     # Initialize engine inside the process
     if engine_config.get("engine_type") == "AI (RIFE ONNX)":
         engine = RIFEONNXEngine()
@@ -127,6 +199,10 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
     multiplier = max(1, int(engine_config.get("frame_multiplier", 2) or 2))
     timesteps = interpolation_timesteps(multiplier) if fg_enabled else []
     last_frame = None
+    generated = 0
+    dropped = 0
+    report_time = time.perf_counter()
+    inference_ms = 0.0
 
     print(f"Sub-process processing worker started (PID: {os.getpid()}, frame gen x{multiplier})")
     
@@ -134,19 +210,36 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
         try:
             # We use a small timeout to check the stop_event periodically
             current_frame = capture_queue.get(timeout=0.1)
-            
-            # Internal Scaling
+        except Exception:
+            continue
+        try:
+            # Safety net: the capture worker already scales frames down.
             h, w = current_frame.shape[:2]
             if w > internal_res[0] or h > internal_res[1]:
                 current_frame = cv2.resize(current_frame, internal_res, interpolation=cv2.INTER_LINEAR)
 
             if timesteps and last_frame is not None:
                 for timestep in timesteps:
-                    process_queue.put(engine.interpolate(last_frame, current_frame, timestep))
-            process_queue.put(current_frame)
-            
+                    started = time.perf_counter()
+                    generated_frame = engine.interpolate(last_frame, current_frame, timestep)
+                    inference_ms += (time.perf_counter() - started) * 1000.0
+                    if not put_latest(process_queue, generated_frame):
+                        dropped += 1
+                    generated += 1
+            if not put_latest(process_queue, current_frame):
+                dropped += 1
             last_frame = current_frame
-        except:
+
+            now = time.perf_counter()
+            if now - report_time >= 5.0:
+                rate = generated / (now - report_time)
+                average = inference_ms / generated if generated else 0.0
+                print(f"[frame gen] {rate:5.1f} frames/s  ·  {average:5.1f} ms por frame"
+                      f"  ·  {dropped} descartados")
+                generated = dropped = 0
+                inference_ms = 0.0
+                report_time = now
+        except Exception:
             continue
 
 class FrameGenerationApp:
@@ -166,6 +259,9 @@ class FrameGenerationApp:
         self.frame_count = 0
         self.start_time = 0
         self.current_fps = 0
+        self.live_fallback = False
+        # Newest captured frame, at processing resolution, for the degraded mode.
+        self.live_queue = Queue(maxsize=1)
         
         # Window & Performance management
         self.last_rect = None
@@ -216,65 +312,78 @@ class FrameGenerationApp:
                 frame = self.capture.capture_frame()
 
                 if frame is not None:
+                    # Scale once, here: the worker processes and the fallback path both
+                    # use this resolution, and fewer bytes cross the process pipe.
+                    frame = self._prepare_frame(frame)
+
                     # Optimized duplicate check
                     is_duplicate = False
                     if last_frame is not None:
                         try:
                             # Slice check is very fast
                             if np.array_equal(frame[10:30:2, 10:30:2], last_frame[10:30:2, 10:30:2]):
-                                if np.array_equal(frame[::60, ::60], last_frame[::60, ::60]):
+                                if np.array_equal(frame[::30, ::30], last_frame[::30, ::30]):
                                     is_duplicate = True
                         except: pass
 
                     if not is_duplicate:
-                        if self.capture_queue.full():
-                            try: self.capture_queue.get_nowait()
-                            except: pass
-                        try:
-                            self.capture_queue.put_nowait(frame)
-                            last_frame = frame
-                        except Full:
-                            pass
+                        last_frame = frame
+                        put_latest(self.live_queue, frame)
+                        put_latest(self.capture_queue, frame)
         finally:
             # Release DXGI/GDI resources on the same worker that used them.
             self.capture.stop_capture()
 
 
+    def _prepare_frame(self, frame):
+        """Downscale a captured frame to the processing resolution."""
+        max_w, max_h = self.internal_res
+        height, width = frame.shape[:2]
+        if width > max_w or height > max_h:
+            frame = cv2.resize(frame, (max_w, max_h), interpolation=cv2.INTER_LINEAR)
+        return frame
+
+    def _take_live_frame(self):
+        """Newest captured frame, used when the pipeline cannot keep up."""
+        frame = None
+        while True:
+            try:
+                frame = self.live_queue.get_nowait()
+            except Empty:
+                return frame
+
     def post_processing_worker(self):
+        """Sharpen at the processing resolution, then upscale once for the display.
+
+        Sharpening before the upscale is the difference between a few milliseconds
+        and tens of milliseconds per frame on a 1080p or larger display.
+        """
         print("Post-processing worker started")
         while self.running:
-            if not self.process_queue.empty():
-                frame = self.process_queue.get()
-                
-                # Push to display
+            try:
+                frame = self.process_queue.get(timeout=0.02)
+            except Empty:
+                continue
+            try:
+                needs_upscale = (frame.shape[1] != self.display_dim[0]
+                                 or frame.shape[0] != self.display_dim[1])
                 if self.ai_mode and self.ai_upscaler:
-                    # AI Reconstruction
                     frame = self.ai_upscaler.upscale(frame)
-                    # Final fit to display if AI output differs
-                    if frame.shape[1] != self.display_dim[0] or frame.shape[0] != self.display_dim[1]:
+                    if (frame.shape[1], frame.shape[0]) != self.display_dim:
                         frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
                 elif self.fsr_mode:
-                    # High-Speed Resizing (EASU-style if FSR mode enabled)
-                    if frame.shape[1] != self.display_dim[0] or frame.shape[0] != self.display_dim[1]:
-                        frame = AMDFilters.apply_easu(frame, self.display_dim)
-                    else:
-                        frame = AMDFilters.apply_cas(frame, self.sharpness)
-                else:
-                    if frame.shape[1] != self.display_dim[0] or frame.shape[0] != self.display_dim[1]:
-                        frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
-                    
-                    # Apply simple sharpening (Fallback)
                     if self.sharpness > 0:
-                        blurred = cv2.GaussianBlur(frame, (0, 0), 3)
-                        frame = cv2.addWeighted(frame, 1.0 + self.sharpness, blurred, -self.sharpness, 0)
-
-                if self.display_queue.full():
-                    try: self.display_queue.get_nowait()
-                    except: pass
-                self.display_queue.put(frame)
-            else:
-                # Slight sleep to reduce CPU usage when idle
-                time.sleep(0.0005)
+                        frame = AMDFilters.apply_cas(frame, self.sharpness)
+                    if needs_upscale:
+                        frame = AMDFilters.apply_easu(frame, self.display_dim)
+                else:
+                    if self.sharpness > 0:
+                        frame = AMDFilters.apply_unsharp(frame, self.sharpness)
+                    if needs_upscale:
+                        frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
+                put_latest(self.display_queue, frame)
+            except Exception as exc:
+                print(f"Post-processing error: {exc}")
 
     def select_game(self):
         ui = GameSelectorUI()
@@ -287,9 +396,11 @@ class FrameGenerationApp:
             rect = get_source_rect(self.target_source)
             monitor_rect = get_source_monitor_rect(self.target_source)
             if rect[2] <= rect[0] or rect[3] <= rect[1]:
-                raise ValueError("A fonte selecionada não tem uma área válida.")
+                raise ValueError(i18n.translate("msg.invalid_source"))
         except Exception as exc:
-            messagebox.showerror("Fonte indisponível", str(exc))
+            if messagebox is not None:
+                messagebox.showerror(i18n.translate("msg.source_unavailable"), str(exc))
+            print(f"Source unavailable: {exc}")
             return False
         self.capture = ScreenCapture(
             region=rect, mode=self.target_source["mode"], desktop_coordinates=True,
@@ -373,17 +484,20 @@ class FrameGenerationApp:
 
     def _hud_parts(self, font, small_font):
         """Render the panel once per status change, not once per displayed frame."""
-        key = (round(self.current_fps), self.fsr_mode, self.ai_mode, self.ultra_smooth)
+        key = (round(self.current_fps), self.fsr_mode, self.ai_mode, self.ultra_smooth,
+               self.live_fallback, i18n.get_language())
         cached = getattr(self, "_hud_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         fps_value = font.render(f"{round(self.current_fps)}", True, HUD_COLORS["accent"])
         fps_label = small_font.render("FPS", True, HUD_COLORS["muted"])
-        hint = small_font.render(f"{self.hotkey_names['stop']}  menu", True, HUD_COLORS["muted"])
+        hint = small_font.render(f"{self.hotkey_names['stop']}  {i18n.translate('hud.menu')}",
+                                 True, HUD_COLORS["muted"])
         chips = []
-        for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth):
+        for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth,
+                                             live=self.live_fallback):
             color = HUD_COLORS[state]
-            text = small_font.render(f"{label} {value}", True, color)
+            text = small_font.render(f"{label} {value}".strip(), True, color)
             chips.append((color, text))
 
         chip_widths = [text.get_width() + HUD_CHIP_PADDING for _, text in chips]
@@ -446,7 +560,7 @@ class FrameGenerationApp:
 
         # Setup Borderless Window
         screen = pygame.display.set_mode((d_w, d_h), display_flags)
-        pygame.display.set_caption("FG Overlay")
+        pygame.display.set_caption(i18n.translate("app.title"))
         
         # FPS Font
         pygame.font.init()
@@ -480,7 +594,6 @@ class FrameGenerationApp:
             p.nice(psutil.HIGH_PRIORITY_CLASS)
         except: pass
 
-        clock = pygame.time.Clock()
         self.running = True
         self.start_time = time.time()
         
@@ -509,7 +622,15 @@ class FrameGenerationApp:
         t_post.start()
         
         frame_interval = 1.0 / self.target_fps
+        # If the pipeline is behind, fall back to the newest captured frame instead
+        # of freezing on the last generated one.
+        stall_timeout = max(0.05, frame_interval * 3)
         last_display_time = time.perf_counter()
+        last_frame_time = last_display_time
+        fps_window_start = last_display_time
+        fps_window_frames = 0
+        diagnostics_time = last_display_time
+        self.sync_counter = 0
 
         try:
             while self.running:
@@ -522,7 +643,21 @@ class FrameGenerationApp:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
-                
+
+                # Honest FPS: measured over a rolling half-second window, so a stalled
+                # pipeline reports (and shows) the real rate instead of a stale value.
+                loop_now = time.perf_counter()
+                if loop_now - fps_window_start >= 0.5:
+                    self.current_fps = fps_window_frames / (loop_now - fps_window_start)
+                    fps_window_frames = 0
+                    fps_window_start = loop_now
+                    if loop_now - diagnostics_time >= 5.0:
+                        diagnostics_time = loop_now
+                        source = "live" if self.live_fallback else "generated"
+                        print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
+                              f"fila {self.display_queue.qsize()}  ·  {source}"
+                              f"  ·  captura {self.frame_multiplier}x")
+
                 # Precision Pacing Logic
                 now = time.perf_counter()
                 if now - last_display_time < frame_interval:
@@ -536,17 +671,32 @@ class FrameGenerationApp:
                 # Buffer check: wait for at least 2 frames to be ready to absorb jitter
                 # in Low Latency mode, we are more aggressive
                 min_buffer = 1 if self.low_latency else 3
-                if self.display_queue.qsize() < min_buffer and self.frame_count > 0:
-                    time.sleep(0.0005) # Shorter wait
-                    continue
-
-                if not self.display_queue.empty():
-                    frame = self.display_queue.get()
-                    last_display_time = now
-                    
-                    # Window sync (minimal overhead)
+                frame = None
+                if self.display_queue.qsize() >= min_buffer or self.frame_count == 0:
                     try:
-                        t_rect = get_source_rect(self.target_source)
+                        frame = self.display_queue.get_nowait()
+                    except Empty:
+                        frame = None
+                if frame is not None:
+                    self.live_fallback = False
+                elif self.frame_count > 0 and now - last_frame_time >= stall_timeout:
+                    frame = self._take_live_frame()
+                    self.live_fallback = frame is not None
+
+                if frame is not None:
+                    last_display_time = now
+                    last_frame_time = now
+                    
+                    # Window sync: checking 15 times a second is enough to follow
+                    # moves and resizes without paying for it on every frame.
+                    self.sync_counter += 1
+                    try:
+                        sync_now = self.sync_counter >= max(1, self.target_fps // 8)
+                        if sync_now:
+                            self.sync_counter = 0
+                            t_rect = get_source_rect(self.target_source)
+                        else:
+                            t_rect = self.last_rect
                         if self.last_rect != t_rect:
                             t_w, t_h = t_rect[2] - t_rect[0], t_rect[3] - t_rect[1]
                             
@@ -576,8 +726,14 @@ class FrameGenerationApp:
 
                     # A queued frame can still have the old size after a source resize.
                     if (frame.shape[1], frame.shape[0]) != self.display_dim:
-                        frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
-                    surface = pygame.image.frombuffer(frame.tobytes(), self.display_dim, 'RGB')
+                        frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
+                    if not frame.flags["C_CONTIGUOUS"]:
+                        frame = np.ascontiguousarray(frame)
+                    try:
+                        # No copy: pygame reads the frame buffer directly.
+                        surface = pygame.image.frombuffer(memoryview(frame), self.display_dim, 'RGB')
+                    except (TypeError, ValueError):
+                        surface = pygame.image.frombuffer(frame.tobytes(), self.display_dim, 'RGB')
                     screen.blit(surface, (0, 0))
                     
                     # Hotkeys & Stats
@@ -603,10 +759,7 @@ class FrameGenerationApp:
                     pygame.display.flip()
                     
                     self.frame_count += 1
-                    if self.frame_count % 30 == 0:
-                        t_now = time.time()
-                        self.current_fps = 30 / (t_now - self.start_time)
-                        self.start_time = t_now
+                    fps_window_frames += 1
                 else:
                     time.sleep(0.0005)
 
@@ -627,16 +780,37 @@ class FrameGenerationApp:
         
         return True
 
-if __name__ == "__main__":
+def runtime_loader():
+    """Heavy imports needed by the overlay and by the source list in the menu."""
+    load_runtime()
+
+
+def main():
     multiprocessing.freeze_support()
     # Use physical pixel coordinates on mixed-DPI monitor layouts.
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except (AttributeError, OSError):
-        ctypes.windll.user32.SetProcessDPIAware()
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+    # Read the preferences file before anything heavy, so the splash can already
+    # speak the saved language while OpenCV, numpy, pygame and DXCAM load.
+    try:
+        startup_settings = SettingsStore().load()
+    except Exception as exc:
+        print(f"Preferences unavailable ({exc}); using defaults")
+        startup_settings = None
+    i18n.set_language(startup_settings["language"] if startup_settings else None)
+    run_splash(runtime_loader)
     while True:
         app = FrameGenerationApp(target_fps=60)
         if not app.run():
             break
         print("Waiting for next selection...")
         time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()

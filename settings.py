@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import tempfile
 
+import i18n
+
 
 CAPTURE_MODES = ("bitblt", "dxcam")
 SCALE_OPTIONS = ("1.0", "1.25", "1.5", "2.0", "Fullscreen")
@@ -18,14 +20,13 @@ MULTIPLIER_MAX = 20
 MULTIPLIER_STEP = 2
 HOTKEY_OPTIONS = tuple(f"F{number}" for number in range(1, 13))
 HOTKEY_SETTING_KEYS = ("hotkey_stop", "hotkey_fps", "hotkey_fsr")
-HOTKEY_LABELS = {
-    "hotkey_stop": "Parar o overlay (voltar ao menu)",
-    "hotkey_fps": "Mostrar / ocultar o contador de FPS",
-    "hotkey_fsr": "Alternar FSR / nitidez",
-}
+# The dialog labels live in the translation catalog (i18n keys "hotkey.stop",
+# "hotkey.fps" and "hotkey.fsr") so they follow the selected language.
 DEFAULT_HOTKEYS = {"hotkey_stop": "F11", "hotkey_fps": "F10", "hotkey_fsr": "F9"}
 DEFAULT_SETTINGS = {
     "version": 1,
+    # First launch opens in English (US); the menu lets the user switch languages.
+    "language": i18n.DEFAULT_LANGUAGE,
     "source_type": "window",
     "mode": "bitblt",
     "fps": 60,
@@ -121,6 +122,7 @@ def normalize_settings(data):
     for key in ("fg_enabled", "ultra_smooth", "performance_mode", "low_latency", "show_fps"):
         if isinstance(data.get(key), bool):
             result[key] = data[key]
+    result["language"] = i18n.normalize_language(data.get("language"))
     result.update(unique_hotkeys(data))
     preferences = data.get("preferred_sources")
     if isinstance(preferences, dict):
