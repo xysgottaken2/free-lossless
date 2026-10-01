@@ -108,7 +108,8 @@ class GameSelectorUI:
                     ctypes.c_void_p(hwnd), attribute, ctypes.byref(enabled), ctypes.sizeof(enabled))
                 if result == 0:
                     break
-        except (AttributeError, OSError, tk.TclError):
+        except Exception:
+            # Cosmetic only: never prevent the menu from opening.
             pass
 
     def _setup_style(self):

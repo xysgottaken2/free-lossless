@@ -33,9 +33,19 @@ jobs:
           python -m pip check
 
       - name: Check syntax and run tests
+        shell: bash
         run: |
           python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py build_app.py
-          python -m unittest discover -s tests -v
+          if python -m unittest discover -s tests -v > unittest.log 2>&1; then
+            cat unittest.log
+          else
+            status=$?
+            cat unittest.log
+            # Also publish the failure text as annotations, which stay readable
+            # from tooling that cannot download raw job logs.
+            python tests/report_failures.py unittest.log
+            exit $status
+          fi
 
       - name: Build executable
         run: python build_app.py
