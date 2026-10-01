@@ -191,7 +191,7 @@ class GameSelectorUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
         header = tk.Frame(self.root, bg=COLORS["background"])
-        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 20))
+        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(20, 16))
         header.columnconfigure(1, weight=1)
         logo = tk.Canvas(header, width=44, height=44, bg=COLORS["background"], highlightthickness=0)
         logo.grid(row=0, column=0, rowspan=2, padx=(0, 14))
@@ -225,7 +225,7 @@ class GameSelectorUI:
         settings_card.columnconfigure(0, weight=1)
         settings_card.rowconfigure(1, weight=1)
         self._label(settings_card, "02  /  Ajustes do overlay", size=14, bold=True).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=22, pady=(20, 12))
+            row=0, column=0, columnspan=2, sticky="w", padx=22, pady=(18, 10))
         self.settings_canvas = tk.Canvas(settings_card, bg=COLORS["panel"], highlightthickness=0,
                                          width=460, yscrollincrement=round(18 * self._ui_scale))
         self.settings_canvas.grid(row=1, column=0, sticky="nsew", padx=(22, 8), pady=(0, 16))
@@ -246,19 +246,19 @@ class GameSelectorUI:
         footer.grid(row=2, column=0, sticky="ew", padx=28, pady=(18, 22))
         footer.columnconfigure(0, weight=1)
         self._label(footer, textvariable=self.session_summary_var, bold=True).grid(row=0, column=0, sticky="w")
-        self._label(footer, "F11 retorna ao menu  ·  Ctrl + Enter inicia o overlay", muted=True, size=9).grid(
-            row=1, column=0, sticky="w", pady=(4, 0))
+        self._label(footer, "F9 FSR  ·  F10 FPS  ·  F11 menu  ·  Ctrl + Enter inicia o overlay",
+                    muted=True, size=9).grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._button(footer, "Sair", self._on_close).grid(row=0, column=1, rowspan=2, padx=(12, 10))
         self.start_button = self._button(footer, "Iniciar overlay  →", self._on_select, primary=True)
         self.start_button.grid(row=0, column=2, rowspan=2)
 
     def _setup_source_card(self, card):
         title = tk.Frame(card, bg=COLORS["panel"])
-        title.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 16))
+        title.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 12))
         self._label(title, "01  /  Fonte de captura", size=14, bold=True).pack(anchor="w")
-        self._label(title, "Escolha uma janela ou um monitor.", muted=True, size=9).pack(anchor="w", pady=(5, 0))
+        self._label(title, "Escolha uma janela ou um monitor.", muted=True, size=9).pack(anchor="w", pady=(4, 0))
         segment = tk.Frame(card, bg=COLORS["input"])
-        segment.grid(row=1, column=0, sticky="ew", padx=20)
+        segment.grid(row=1, column=0, sticky="ew", padx=18)
         for column, (value, label) in enumerate((("window", "Janela / jogo"), ("display", "Monitor"))):
             segment.columnconfigure(column, weight=1)
             tk.Radiobutton(segment, text=label, value=value, variable=self.source_var, indicatoron=False,
@@ -268,18 +268,19 @@ class GameSelectorUI:
                            activebackground=COLORS["border"], activeforeground=COLORS["text"],
                            padx=12, pady=10, cursor="hand2").grid(row=0, column=column, sticky="ew")
         list_header = tk.Frame(card, bg=COLORS["panel"])
-        list_header.grid(row=2, column=0, sticky="ew", padx=20, pady=(16, 10))
+        list_header.grid(row=2, column=0, sticky="ew", padx=18, pady=(12, 8))
         list_header.columnconfigure(0, weight=1)
         self.list_label = self._label(list_header, size=9, bold=True)
         self.list_label.grid(row=0, column=0, sticky="w")
         self._label(list_header, textvariable=self.source_count_var, muted=True, size=9).grid(row=1, column=0, sticky="w")
         self._button(list_header, "↻ Atualizar", self._refresh_list).grid(row=0, column=1, rowspan=2, padx=(8, 0))
         list_frame = tk.Frame(card, bg=COLORS["panel"])
-        list_frame.grid(row=3, column=0, sticky="nsew", padx=20)
+        list_frame.grid(row=3, column=0, sticky="nsew", padx=18)
         list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        # Keep enough of the list usable on short screens instead of collapsing it.
+        list_frame.rowconfigure(0, weight=1, minsize=round(110 * self._ui_scale))
         self.tree = ttk.Treeview(list_frame, columns=("Title", "Process"), show="headings", selectmode="browse",
-                                 height=5, style="App.Treeview")
+                                 height=4, style="App.Treeview")
         self.tree.heading("Title", text="Título da janela")
         self.tree.heading("Process", text="Processo")
         self.tree.column("Title", width=200, minwidth=100)
@@ -296,26 +297,15 @@ class GameSelectorUI:
                                     font=("Segoe UI", 10), justify=tk.CENTER,
                                     wraplength=240, padx=12, pady=12)
         summary = tk.Frame(card, bg=COLORS["input"])
-        summary.grid(row=4, column=0, sticky="ew", padx=20, pady=(12, 16))
-        self._label(summary, "FONTE SELECIONADA", muted=True, size=8, bold=True).pack(anchor="w", padx=12, pady=(10, 4))
+        summary.grid(row=4, column=0, sticky="ew", padx=18, pady=(10, 14))
         selected_label = self._label(summary, textvariable=self.selected_title_var, bold=True, anchor="w")
-        selected_label.pack(fill=tk.X, padx=12)
-        detail_label = self._label(summary, textvariable=self.selected_detail_var, muted=True, size=9,
-                                   justify=tk.LEFT, anchor="w")
-        detail_label.pack(fill=tk.X, padx=12, pady=(4, 10))
+        selected_label.pack(fill=tk.X, padx=12, pady=(8, 1))
+        self.selected_detail_label = self._label(summary, textvariable=self.selected_detail_var, muted=True,
+                                                 size=9, justify=tk.LEFT, anchor="w")
+        self.selected_detail_label.pack(fill=tk.X, padx=12, pady=(0, 8))
         summary.bind("<Configure>", lambda event: (
             selected_label.config(wraplength=max(180, event.width - 24)),
             detail_label.config(wraplength=max(180, event.width - 24))))
-        shortcuts = tk.Frame(card, bg=COLORS["panel"])
-        shortcuts.grid(row=5, column=0, sticky="ew", padx=20, pady=(0, 18))
-        self._label(shortcuts, "ATALHOS DO OVERLAY", muted=True, size=8, bold=True).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 7))
-        for column, (key, description) in enumerate((("F9", "FSR"), ("F10", "FPS"), ("F11", "Menu"))):
-            shortcuts.columnconfigure(column, weight=1)
-            group = tk.Frame(shortcuts, bg=COLORS["input"])
-            group.grid(row=1, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0))
-            self._label(group, key, size=9, bold=True).pack(side=tk.LEFT, padx=(8, 4), pady=6)
-            self._label(group, description, muted=True, size=9).pack(side=tk.LEFT, padx=(0, 8))
 
     def _section(self, parent, text, row):
         section = tk.Frame(parent, bg=COLORS["panel"])

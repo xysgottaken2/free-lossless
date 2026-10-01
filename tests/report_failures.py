@@ -4,8 +4,9 @@ Raw Actions logs are not always reachable from tooling, while the check-run
 annotations API is; turning the failure text into ``::error::`` workflow commands
 keeps Windows-only failures diagnosable from the command line.
 
-Newlines have to be escaped (``%0A``) because the runner ends a workflow command
-at the end of the line; unescaped text would lose everything after the first line.
+A workflow command ends at the end of its line, and GitHub stores the annotation
+message literally (it does not decode ``%0A``), so log lines are joined with a
+visible separator instead of newlines.
 """
 from pathlib import Path
 import sys
@@ -16,37 +17,41 @@ MAX_CHARS = 6000
 MAX_LINE = 300
 HEAD_LINES = 60
 TAIL_LINES = 240
+SEPARATOR = " | "
+EMPTY_LOG_NOTE = "unittest failed without producing output"
 
 
-def escape_workflow_data(text):
-    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
-def relevant_lines(text, head=HEAD_LINES, tail=TAIL_LINES, max_line=MAX_LINE):
+def relevant_lines(text, status=None, head=HEAD_LINES, tail=TAIL_LINES, max_line=MAX_LINE):
     """Keep the head (startup errors) and the tail (failure details and summary)."""
-    lines = [line.rstrip()[:max_line] for line in text.splitlines() if line.strip()]
+    lines = [line.strip()[:max_line] for line in text.splitlines() if line.strip()]
+    if not text.strip():
+        lines = [EMPTY_LOG_NOTE]
+    if status is not None:
+        lines.append(f"unittest exit status: {status}")
     if len(lines) <= head + tail:
         return lines
     return lines[:head] + [f"... middle of the log omitted ({len(lines) - head - tail} lines) ..."] + lines[-tail:]
 
 
 def annotation_chunks(text, status=None, max_annotations=MAX_ANNOTATIONS, max_chars=MAX_CHARS):
-    """Group log lines into ``::error::`` commands, preserving their original order."""
-    lines = relevant_lines(text)
-    if status is not None:
-        lines.append(f"unittest exit status: {status}")
-    if not lines:
-        lines = ["unittest failed without producing output"]
+    """Group log lines into single-line ``::error::`` commands, newest output last."""
     chunks = []
-    current = ""
-    for line in lines:
-        if current and len(current) + len(line) + 1 > max_chars and len(chunks) < max_annotations - 1:
+    current = []
+    size = 0
+    for line in relevant_lines(text, status):
+        if current and size + len(line) + len(SEPARATOR) > max_chars:
             chunks.append(current)
-            current = ""
-        current += line + "\n"
+            current = []
+            size = 0
+        current.append(line)
+        size += len(line) + len(SEPARATOR)
     if current:
         chunks.append(current)
-    return [f"::error::{escape_workflow_data(chunk)}" for chunk in chunks]
+    if len(chunks) > max_annotations:
+        # Failure details and the summary live at the end, so drop the oldest chunks.
+        dropped = len(chunks) - (max_annotations - 1)
+        chunks = [["... earlier log lines omitted ..."]] + chunks[dropped:]
+    return [f"::error::{SEPARATOR.join(chunk)}" for chunk in chunks]
 
 
 def main(argv):

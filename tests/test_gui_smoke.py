@@ -140,7 +140,10 @@ class RealTkSmokeTests(unittest.TestCase):
         root_bottom = ui.root.winfo_rooty() + ui.root.winfo_height()
         button_bottom = ui.start_button.winfo_rooty() + ui.start_button.winfo_height()
         self.assertLessEqual(button_bottom, root_bottom)
-        self.assertGreater(ui.tree.winfo_height(), 35)
+        self.assertGreaterEqual(ui.tree.winfo_height(), 110)
+        # The compaction must fit the whole source card: nothing may spill outside it.
+        detail_bottom = ui.selected_detail_label.winfo_rooty() + ui.selected_detail_label.winfo_height()
+        self.assertLessEqual(detail_bottom, root_bottom)
         ui.low_latency_check.focus_force()
         ui.root.update()
         canvas_top = ui.settings_canvas.winfo_rooty()
