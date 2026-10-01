@@ -43,9 +43,18 @@ jobs:
             cat unittest.log
             # Also publish the failure text as annotations, which stay readable
             # from tooling that cannot download raw job logs.
-            python tests/report_failures.py unittest.log
+            python tests/report_failures.py unittest.log "$status"
             exit $status
           fi
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unittest-log
+          path: unittest.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build executable
         run: python build_app.py
