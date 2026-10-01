@@ -1,7 +1,10 @@
 import cv2
 import numpy as np
 import os
-import requests
+
+import diagnostics
+import ort_providers
+
 
 class AMDFilters:
     """Sharpening and upscaling that stay cheap enough for real-time frames.
@@ -73,31 +76,31 @@ class NvidiaAIUpscaler:
     def __init__(self, model_path=None):
         self.model_path = model_path or os.path.join(os.path.dirname(__file__), "models", "fsrcnn_x2.onnx")
         self.session = None
-        self._download_model_if_missing()
-        self._init_session()
+        if self._check_model_file():
+            self._init_session()
 
-    def _download_model_if_missing(self):
-        if not os.path.exists(self.model_path):
-            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-            print(f"Downloading AI model to {self.model_path}...")
-            # Using a public lightweight FSRCNN ONNX model
-            url = "https://github.com/onuralpszener/FSRCNN-PyTorch/raw/master/fsrcnn_x2.onnx"
-            try:
-                r = requests.get(url, allow_redirects=True)
-                with open(self.model_path, 'wb') as f:
-                    f.write(r.content)
-                print("Model downloaded successfully.")
-            except Exception as e:
-                print(f"Failed to download model: {e}")
+    def _check_model_file(self):
+        """The model ships with the app; a missing file is a real problem to report."""
+        if os.path.exists(self.model_path):
+            return True
+        message = f"modelo de upscale ausente: {self.model_path}"
+        print(f"AI SuperRes disabled: {message}")
+        diagnostics.write_now("ia", message)
+        return False
 
     def _init_session(self):
         try:
-            import onnxruntime as ort
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            print(f"Inference session initialized with {self.session.get_providers()}")
+            # DirectML first: the same model runs in a few milliseconds on a GPU and
+            # in hundreds of milliseconds on the CPU, which is the difference between
+            # a filter that fits the frame budget and one that stalls the overlay.
+            self.session, providers = ort_providers.create_session(self.model_path)
+            used = ort_providers.describe(self.session)
+            print(f"AI upscaler session initialized with {used}")
+            diagnostics.write_now("ia", f"upscaler ONNX em {used}")
         except Exception as e:
+            self.session = None
             print(f"Error initializing ONNX session: {e}")
+            diagnostics.write_now("ia", f"erro ao carregar o modelo de upscale: {e}")
 
     def upscale(self, img):
         if self.session is None: return img

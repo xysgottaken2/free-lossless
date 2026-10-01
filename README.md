@@ -151,6 +151,28 @@ Além disso:
   prioridade **abaixo do normal**, para nunca competir com o jogo nem com a exibição.
 - Motor de IA sem GPU (RIFE na CPU) leva segundos por frame: o worker detecta e troca
   para o motor rápido (DIS Flow) na mesma sessão, em vez de travar o overlay.
+- Com DirectML o RIFE roda na GPU: escolha **AI (RIFE ONNX)** para a melhor qualidade de
+  interpolação; o motor **Fast (DIS Flow)** continua sendo o mais leve.
+
+### Filtros de IA no Windows (RIFE e AI SuperRes)
+
+Os dois filtros de IA rodam em ONNX Runtime. No Windows o app instala o
+`onnxruntime-directml`, então **os modelos rodam na GPU de qualquer fabricante**
+(NVIDIA, AMD ou Intel) — a RTX 2060, por exemplo, usa DirectML normalmente. Sem
+DirectML/CUDA o ONNX Runtime cai para a CPU, onde o RIFE leva segundos por quadro e o
+upscale de IA leva centenas de milissegundos; para o overlay nunca virar um slideshow:
+
+- **Motor de interpolação**: se o motor de IA não conseguir iniciar ou levar mais de
+  250 ms por quadro, o worker troca para o motor rápido (**Fast (DIS Flow)**) na mesma
+  sessão e registra o motivo no log.
+- **AI SuperRes**: o custo do filtro é medido uma vez, na abertura do overlay. Se não
+  couber no orçamento de quadros (2 intervalos de quadro), o filtro é desligado naquela
+  sessão, com o motivo no log e no console. Filtro lento não derruba mais o FPS.
+- O modelo que acompanha o app é um **FSRCNN x2 de verdade** (`models/fsrcnn_x2.onnx`,
+  100 KB, MIT) — veja `models/README.md`. O arquivo anterior no repositório era um
+  placeholder inválido, então o filtro não fazia nada.
+- A conversão **YCbCr** usada no treino do modelo está embutida no grafo ONNX: o app
+  entrega RGB e a conversão roda na GPU, sem custo na CPU.
 
 ### Diagnóstico
 

@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover - the Windows build always ships Tk
 
 import diagnostics
 import i18n
+import ort_providers
 from settings import (DEFAULT_HOTKEYS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
                       MULTIPLIER_MIN, MULTIPLIER_STEP, SettingsStore)
 from splash import run_splash
@@ -86,6 +87,9 @@ def capture_interval(target_fps, multiplier):
 # Generation may use at most this share of the capture interval; the rest is
 # headroom for capture, queueing and display, which must never be starved.
 GENERATION_BUDGET_RATIO = 0.9
+# A filter that needs more than this many frame intervals cannot keep up with the
+# overlay; it is dropped for the session instead of turning the image into a slideshow.
+AI_UPSCALE_BUDGET_RATIO = 2.0
 # An engine slower than this cannot generate frames for a real-time overlay.
 SLOW_ENGINE_MS = 250.0
 
@@ -244,8 +248,15 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
 
     engine = build_engine(engine_type)
     used_engine, providers = describe(engine, engine_type)
+    if engine_type == "AI (RIFE ONNX)" and getattr(engine, "session", None) is None:
+        # No session means the model could not be loaded at all: generating with it
+        # would silently return one of the captured frames.
+        diagnostics.write_now("motor", "RIFE ONNX não iniciou (DirectML/CUDA indisponível?): "
+                                       "usando o motor Fast (DIS Flow) nesta sessão")
+        engine = build_engine("Fast (DIS Flow)")
+        used_engine, providers = describe(engine, "Fast (DIS Flow)")
     diagnostics.write_now("motor", f"{used_engine} iniciado no worker (PID {os.getpid()}){f' [{providers}]' if providers else ''}")
-    if engine_type == "AI (RIFE ONNX)" and providers and not any(
+    if engine_type == "AI (RIFE ONNX)" and "Fast" not in used_engine and providers and not any(
             name in providers for name in ("DmlExecutionProvider", "CUDAExecutionProvider")):
         diagnostics.write_now("motor", "RIFE está rodando na CPU; a geração de frames será lenta. "
                                        "Instale onnxruntime-directml ou use o motor Fast (DIS Flow).")
@@ -522,6 +533,46 @@ class FrameGenerationApp:
         self.want_live_frames = self.live_fallback
         self.last_frame_generated = from_generator
         return frame
+
+    def _prepare_ai_upscaler(self):
+        """Measure the AI upscaler once and drop it when it cannot keep up.
+
+        The same FSRCNN model costs a few milliseconds on a GPU and hundreds of
+        milliseconds on the CPU. Rather than stalling every frame, the filter is
+        turned off for the session with the reason written to the log (and to the
+        console), and the normal sharpening/upscale path takes over.
+        """
+        if not (self.ai_mode and self.ai_upscaler):
+            return
+        provider = ort_providers.describe(getattr(self.ai_upscaler, "session", None))
+        if getattr(self.ai_upscaler, "session", None) is None:
+            self.ai_mode = False
+            message = "modelo de AI SuperRes indisponível: filtro desativado nesta sessão"
+            print(f"AI upscaler disabled ({message})")
+            diagnostics.write_now("ia", message)
+            return
+        width, height = self.internal_res
+        sample = np.zeros((height, width, 3), dtype=np.uint8)
+        try:
+            self.ai_upscaler.upscale(sample)          # the first call also builds the GPU kernels
+            started = time.perf_counter()
+            self.ai_upscaler.upscale(sample)
+            cost_ms = (time.perf_counter() - started) * 1000.0
+        except Exception as exc:
+            cost_ms = float("inf")
+            diagnostics.write_now("ia", f"falha ao executar o upscaler: {exc}")
+        limit_ms = max(AI_UPSCALE_BUDGET_RATIO * 1000.0 / max(1, self.target_fps), 20.0)
+        if cost_ms > limit_ms:
+            self.ai_mode = False
+            message = (f"AI SuperRes levou {cost_ms:.0f} ms por quadro em {provider} "
+                       f"(limite de {limit_ms:.0f} ms para {self.target_fps} FPS): "
+                       f"filtro desativado nesta sessão")
+            print(f"AI upscaler disabled ({message})")
+            diagnostics.write_now("ia", message)
+        else:
+            message = f"AI SuperRes ativo: {cost_ms:.1f} ms por quadro em {provider}"
+            print(message)
+            diagnostics.write_now("ia", message)
 
     def _render_for_display(self, frame):
         """Sharpen at the processing resolution, then upscale once for the display.
@@ -805,6 +856,8 @@ class FrameGenerationApp:
         )
         t_post = threading.Thread(target=self.post_processing_worker, daemon=True)
         
+        self._prepare_ai_upscaler()
+
         t_cap.start()
         p_proc.start()
         t_post.start()

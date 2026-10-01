@@ -13,6 +13,26 @@ datas = [
     ("models", "models"),
 ]
 
+def check_gpu_runtime():
+    """Warn early when the ONNX runtime has no GPU provider.
+
+    PyInstaller's onnxruntime hook collects the provider DLLs (including
+    DirectML.dll), but only from the package that is installed. A CPU-only
+    onnxruntime makes every AI filter fall back to the CPU, which is hundreds of
+    times slower, so the build should say it out loud.
+    """
+    try:
+        import onnxruntime
+    except ImportError:
+        print("WARNING: onnxruntime is not installed; the AI filters will be disabled.")
+        return
+    providers = onnxruntime.get_available_providers()
+    print(f"onnxruntime providers: {providers}")
+    if not any(name in providers for name in ("DmlExecutionProvider", "CUDAExecutionProvider")):
+        print("WARNING: no GPU provider found. Install 'onnxruntime-directml' before building,")
+        print("         otherwise the AI engines run on the CPU.")
+
+
 # Hidden imports that might be missed
 hidden_imports = [
     "onnxruntime",
@@ -54,6 +74,8 @@ def build():
     # Add hidden imports
     for imp in hidden_imports:
         params.extend(["--hidden-import", imp])
+
+    check_gpu_runtime()
 
     # Run PyInstaller
     PyInstaller.__main__.run(params)

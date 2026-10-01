@@ -4,6 +4,10 @@ import time
 import os
 import requests
 
+import diagnostics
+import ort_providers
+
+
 class RIFEEngine:
     def __init__(self, model_version="rife-v4"):
         """
@@ -172,27 +176,20 @@ class RIFEONNXEngine:
     def _init_session(self):
         try:
             import onnxruntime as ort
-            # We prefer DirectML for Windows GPUs (all vendors), then CUDA, then CPU
-            providers = [
-                'DmlExecutionProvider', 
-                'CUDAExecutionProvider', 
-                'CPUExecutionProvider'
-            ]
-            
-            # Optimization: Enable optimizations and fixed shape if possible
+            # DirectML (every Windows GPU), then CUDA, then the CPU.
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            
-            self.session = ort.InferenceSession(self.model_path, sess_options=sess_options, providers=providers)
-            
-            used_providers = self.session.get_providers()
-            print(f"RIFE Inference session initialized with: {used_providers}")
-            
-            if 'DmlExecutionProvider' not in used_providers and 'CUDAExecutionProvider' not in used_providers:
+            self.session, providers = ort_providers.create_session(self.model_path, sess_options)
+            used = ort_providers.describe(self.session)
+            print(f"RIFE Inference session initialized with: {used}")
+            diagnostics.write_now("motor", f"RIFE ONNX em {used}")
+            if not ort_providers.is_gpu(providers):
                 print("WARNING: RIFE is running on CPU. Performance will be low.")
                 print("HINT: Install 'onnxruntime-directml' for GPU acceleration on Windows.")
+                diagnostics.write_now("motor", "RIFE rodando na CPU (sem DirectML/CUDA)")
         except Exception as e:
             print(f"Error initializing RIFE ONNX session: {e}")
+            diagnostics.write_now("motor", f"erro ao iniciar o RIFE: {e}")
 
     def interpolate(self, frame1, frame2, timestep=0.5):
         if self.session is None:

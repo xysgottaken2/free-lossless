@@ -119,7 +119,14 @@ class GenerationBudgetFallbackTests(unittest.TestCase):
         queued = self.run_worker()
         self.assertIs(queued[-1], self.frames[-1])
 
+    def test_a_session_that_never_started_switches_to_the_fast_engine_at_once(self):
+        self.run_worker()                            # setUp leaves the session as None
+        self.engine.interpolate.assert_not_called()
+        self.deps["engine"].RIFEEngine.assert_called()
+        self.assertTrue(any("não iniciou" in message for message in self.messages))
+
     def test_slow_engine_gets_no_more_work_after_the_switch(self):
+        self.engine.session = MagicMock()            # the session exists, it is just slow
         calls = []
 
         def slow(first, second, timestep):
