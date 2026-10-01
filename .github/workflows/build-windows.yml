@@ -97,7 +97,12 @@ jobs:
         run: |
           echo "single file:" && ls -la release/single-file
           echo "portable:" && du -sh release/portable && ls release/portable | head -20
-          echo "SDL2 (D3D11) e bindings _sdl2 no pacote:"
-          ls release/portable | grep -i sdl2 || (echo "SDL2.dll ausente" && exit 1)
-          ls release/portable/_internal/pygame/_sdl2/*.pyd release/portable/_internal/pygame/_sdl2/*.dll 2>/dev/null \
-            || (echo "bindings _sdl2 ausentes: o modo D3D11 nao funcionaria" && exit 1)
+          echo "raiz do pacote:" && ls release/portable | head -25
+          echo "DLLs do SDL:" && find release/portable -iname "SDL2*.dll" | head -5
+          echo "bindings _sdl2:" && find release/portable -path "*_sdl2*" \( -name "*.pyd" -o -name "*.dll" \) | head -5
+          # O modo D3D11 (ReShade) depende destes arquivos dentro do pacote.
+          find release/portable -iname "SDL2*.dll" | grep -q . \
+            || { echo "::error::SDL2.dll fora do pacote: o overlay nao abriria"; exit 1; }
+          find release/portable -path "*_sdl2*" \( -name "*.pyd" -o -name "*.dll" \) | grep -q . \
+            || { echo "::error::bindings _sdl2 fora do pacote: o modo D3D11 (ReShade) nao funcionaria no .exe"; exit 1; }
+          echo "pacote verificado: SDL2 e _sdl2 presentes"
