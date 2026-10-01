@@ -135,11 +135,28 @@ Além disso:
   10 a 20 vezes mais por frame.
 - As filas descartam o frame **mais antigo** quando enchem, em vez de travar a
   captura: o overlay mostra sempre o frame mais recente disponível.
-- Se a pipeline atrasar (por exemplo, um multiplicador alto numa GPU fraca), o painel
-  passa a exibir a captura direta e marca `LIVE` em vez de congelar na imagem antiga.
+- A geração de frames é **adaptativa**: o worker só interpola o que cabe no intervalo
+  entre duas capturas. Um motor mais lento que a captura deixa de enfileirar frames
+  atrasados — melhor mostrar só os frames reais, sempre novos, do que um slideshow de
+  frames interpolados velhos.
+- A imagem **nunca para**: quando não há frame gerado pronto, o overlay mostra a
+  captura mais recente já preparada (mesma nitidez e mesmo upscale), então a troca de
+  fonte não muda o visual do quadro.
+- O chip de status não pisca: ele só marca `LIVE` depois de um atraso contínuo de
+  meio segundo e só volta para `FG` depois de outro meio segundo de frames gerados. O
+  chip também mostra a taxa real de geração (por exemplo, `FG 118/s`).
 - O contador de FPS é medido de verdade, numa janela de meio segundo: se a pipeline
   não acompanhar, o número cai em vez de mentir.
-- O processo do overlay roda com prioridade alta, e o worker de interpolação também.
+- O processo do overlay roda com prioridade alta; o worker de interpolação roda com
+  prioridade **abaixo do normal**, para nunca competir com o jogo nem com a exibição.
+- Motor de IA sem GPU (RIFE na CPU) leva segundos por frame: o worker detecta e troca
+  para o motor rápido (DIS Flow) na mesma sessão, em vez de travar o overlay.
+
+### Diagnóstico
+
+Cada sessão do overlay grava um resumo em `overlay.log`, na mesma pasta do arquivo de
+preferências (`%LOCALAPPDATA%\FreeLossless` no Windows). O log registra resolução
+interna, FPS exibidos, frames gerados por segundo, fila e cada troca de fonte.
 
 ## Setup Guide (developers / running from source)
 

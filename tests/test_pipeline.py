@@ -33,6 +33,109 @@ class FakeCaptureQueue:
         return self.frames.pop(0)
 
 
+class GenerationBudgetTests(unittest.TestCase):
+    """A generator slower than the capture rate must not queue stale frames."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps)
+
+    def test_everything_fits_when_the_engine_is_fast(self):
+        steps = self.module.interpolation_timesteps(6)
+        self.assertEqual(self.module.affordable_timesteps(steps, 60.0, 5.0), steps)
+        self.assertEqual(self.module.affordable_timesteps(steps, 60.0, 0.0), steps)
+
+    def test_nothing_is_generated_when_even_one_frame_does_not_fit(self):
+        steps = self.module.interpolation_timesteps(6)
+        self.assertEqual(self.module.affordable_timesteps(steps, 16.0, 40.0), [])
+
+    def test_partial_budget_spreads_the_generated_frames(self):
+        steps = self.module.interpolation_timesteps(8)
+        picked = self.module.affordable_timesteps(steps, 60.0, 20.0)  # room for three
+        self.assertEqual(len(picked), 3)
+        self.assertEqual(picked, sorted(set(picked)))
+        self.assertTrue(set(picked).issubset(set(steps)))
+        self.assertGreater(picked[-1], picked[0])
+
+    def test_unknown_cost_keeps_the_requested_frames(self):
+        steps = self.module.interpolation_timesteps(4)
+        self.assertEqual(self.module.affordable_timesteps(steps, 0.0, 0.0), steps)
+        self.assertEqual(self.module.affordable_timesteps([], 60.0, 5.0), [])
+
+
+class GenerationBudgetFallbackTests(unittest.TestCase):
+    """The worker switches away from an engine that cannot generate in real time."""
+
+    def setUp(self):
+        if np is None:
+            self.skipTest("numpy is not installed")
+        self.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                          "filters", "win32gui", "win32api", "win32con", "tkinter")
+        self.module = load_module("main", self.deps)
+        self.patch = patch.dict(sys.modules, self.deps)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.messages = []
+        self.module.diagnostics.ENABLED = False
+        self.module.diagnostics.write = lambda message: self.messages.append(str(message))
+        self.addCleanup(setattr, self.module.diagnostics, "write", self.module.diagnostics.write)
+        self.engine = MagicMock()
+        self.engine.session = None
+        self.engine.interpolate.side_effect = lambda a, b, step: ("interp", step)
+        self.deps["engine"].RIFEONNXEngine.return_value = self.engine
+        self.fast_engine = MagicMock()
+        self.fast_engine.interpolate.side_effect = lambda a, b, step: ("fast", step)
+        self.deps["engine"].RIFEEngine.return_value = self.fast_engine
+        self.frames = [np.full((8, 8, 3), value, dtype=np.uint8) for value in (0, 5, 10, 15)]
+        self.process_queue = MagicMock()
+
+    def run_worker(self, engine_type="AI (RIFE ONNX)", frames=None, fg_enabled=True):
+        frames = frames if frames is not None else self.frames
+        config = {"engine_type": engine_type, "fg_enabled": fg_enabled,
+                  "frame_multiplier": 2, "internal_res": (800, 600)}
+        self.module.processing_subroutine(FakeCaptureQueue(frames), self.process_queue, config,
+                                          FakeStopEvent(len(frames)))
+        return [call.args[0] for call in self.process_queue.put_nowait.call_args_list]
+
+    def test_slow_ai_engine_is_replaced_by_the_fast_one_in_the_same_session(self):
+        def slow(first, second, timestep):
+            import time as time_module
+            time_module.sleep(0.3)
+            return ("interp", timestep)
+
+        self.engine.interpolate.side_effect = slow
+        queued = self.run_worker()
+        self.assertTrue(self.deps["engine"].RIFEEngine.called)
+        self.assertTrue(any("Fast (DIS Flow)" in message for message in self.messages))
+        self.assertTrue(any(isinstance(item, tuple) and item[0] == "fast" for item in queued))
+
+    def test_fast_engine_is_left_alone(self):
+        self.run_worker(engine_type="Fast (DIS Flow)")
+        self.deps["engine"].RIFEONNXEngine.assert_not_called()
+
+    def test_real_frames_always_reach_the_display(self):
+        queued = self.run_worker()
+        self.assertIs(queued[-1], self.frames[-1])
+
+    def test_slow_engine_gets_no_more_work_after_the_switch(self):
+        calls = []
+
+        def slow(first, second, timestep):
+            calls.append(timestep)
+            import time as time_module
+            time_module.sleep(0.3)
+            return ("interp", timestep)
+
+        self.engine.interpolate.side_effect = slow
+        self.run_worker()
+        # The first (slow) frame is what triggers the switch, nothing else is asked
+        # of the AI engine afterwards.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.fast_engine.interpolate.call_count, 3)  # the rest of the session
+
+
 class FrameGenerationHelpersTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -99,7 +202,7 @@ class ProcessingSubroutineTests(unittest.TestCase):
         self.engine.interpolate.side_effect = lambda first, second, timestep: ("interp", timestep)
         self.deps["engine"].RIFEONNXEngine.return_value = self.engine
         self.deps["engine"].RIFEEngine.return_value = self.engine
-        self.frames = [np.zeros((8, 8, 3), dtype=np.uint8), np.full((8, 8, 3), 5, dtype=np.uint8)]
+        self.frames = [np.full((8, 8, 3), value, dtype=np.uint8) for value in (0, 5)]
         self.process_queue = MagicMock()
 
     def run_worker(self, multiplier, fg_enabled=True):

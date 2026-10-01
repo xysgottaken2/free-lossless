@@ -87,10 +87,15 @@ class RIFEEngine:
         protection_mask = np.maximum(static_mask, edge_mask)
         protection_mask = cv2.dilate(protection_mask, np.ones((3, 3), np.uint8))
         protection_mask = cv2.GaussianBlur(protection_mask, (5, 5), 0)
-        
+
+        # Motion magnitude, also at the small scale: 16x cheaper than at full
+        # resolution and the mask is smoothed anyway.
+        small_mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        # 0 = pure warp, 0.4 = mix with a cross-fade where motion is extreme.
+        small_blend = np.clip(small_mag / 30.0, 0.0, 1.0) * 0.4
+
         # Dampen flow: 0 flow in protected areas
-        flow[..., 0] *= (1.0 - protection_mask)
-        flow[..., 1] *= (1.0 - protection_mask)
+        flow *= (1.0 - protection_mask)[..., np.newaxis]
 
         # 6. Scale and resize flow
         flow = flow * (1.0 / scale)
@@ -102,9 +107,6 @@ class RIFEEngine:
             self.map_x = self.map_x.astype(np.float32)
             self.map_y = self.map_y.astype(np.float32)
             self.last_h, self.last_w = h, w
-        
-        # Motion magnitude for adaptive blending
-        mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
         
         # Forward warp map (frame1 -> intermediate frame)
         m1_x = self.map_x + flow[..., 0] * timestep
@@ -118,23 +120,21 @@ class RIFEEngine:
         inter1 = cv2.remap(frame1, m1_x, m1_y, cv2.INTER_LINEAR)
         inter2 = cv2.remap(frame2, m2_x, m2_y, cv2.INTER_LINEAR)
         
-        # Adaptive Blending: favor cross-fade in extreme motion or flow noise
-        # mag_mask identifies areas with very high displacement
-        blend_mask = np.clip(mag / 30.0, 0, 1.0)
-        
-        # Weighted combination: 
-        # In low motion, use full warping. 
-        # In high motion, mix with cross-fade to hide artifacts.
+        # Weighted combination: in low motion the warped frames win; in extreme
+        # motion the mask mixes in a cross-fade to hide artifacts.
         combined = cv2.addWeighted(inter1, 1.0 - timestep, inter2, timestep, 0)
         
-        if np.max(blend_mask) > 0.05:
-            cross_fade = cv2.addWeighted(frame1, 1.0 - timestep, frame2, timestep, 0)
-            mask_3c = cv2.merge([blend_mask, blend_mask, blend_mask])
-            # Factor 0.4 ensures we still see some motion even in high-speed areas
-            final = combined * (1.0 - mask_3c * 0.4) + cross_fade * (mask_3c * 0.4)
-            return final.astype(np.uint8)
-        
-        return combined
+        # Everything below stays in uint8: the float32 version allocated several
+        # full-resolution temporaries and cost more than the flow itself.
+        blend_mask = cv2.resize(small_blend, (w, h), interpolation=cv2.INTER_LINEAR)
+        weight = cv2.convertScaleAbs(blend_mask, alpha=255.0)
+        if cv2.countNonZero(weight) == 0:
+            return combined
+        weight_rgb = cv2.cvtColor(weight, cv2.COLOR_GRAY2RGB)
+        cross_fade = cv2.addWeighted(frame1, 1.0 - timestep, frame2, timestep, 0)
+        inverse = cv2.bitwise_not(weight_rgb)  # 255 - weight, in place of a subtraction
+        return cv2.add(cv2.multiply(combined, inverse, scale=1.0 / 255.0),
+                       cv2.multiply(cross_fade, weight_rgb, scale=1.0 / 255.0))
 
 
 class RIFEONNXEngine:

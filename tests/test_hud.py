@@ -66,6 +66,7 @@ class OverlayHudTests(unittest.TestCase):
         app.ai_mode = state.get("ai_mode", True)
         app.ultra_smooth = state.get("ultra_smooth", False)
         app.live_fallback = state.get("live_fallback", False)
+        app.generated_fps = state.get("generated_fps", 60.4)
         app.hotkey_names = dict(self.module.DEFAULT_HOTKEY_NAMES)
         return app
 
@@ -85,6 +86,12 @@ class OverlayHudTests(unittest.TestCase):
     def test_chips_say_when_frames_come_straight_from_the_capture(self):
         chips = self.module.hud_chips(False, False, False, live=True)
         self.assertEqual(chips[-1], ("", "LIVE", "mode"))
+
+    def test_chips_report_how_fast_frames_are_generated(self):
+        self.assertEqual(self.module.hud_chips(False, False, False, generated_fps=118.6)[-1],
+                         ("", "FG 119/s", "on"))
+        self.assertEqual(self.module.hud_chips(False, False, False, live=True, generated_fps=0.4)[-1],
+                         ("", "LIVE", "mode"))  # nothing generated: no rate to show
 
     def test_chips_follow_the_selected_language(self):
         i18n.set_language("pt-BR")

@@ -1,8 +1,12 @@
 """Load platform-specific modules without requiring a GPU or a Windows desktop."""
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from unittest.mock import MagicMock, patch
+
+# Tests must never write into the log of a real session running on this machine.
+os.environ.setdefault("FREE_LOSSLESS_LOG", "0")
 
 ROOT = Path(__file__).resolve().parents[1]
 

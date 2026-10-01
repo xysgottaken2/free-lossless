@@ -10,6 +10,7 @@ try:  # Tk is only needed for the error dialog, and it is missing on some Linux 
 except ImportError:  # pragma: no cover - the Windows build always ships Tk
     messagebox = None
 
+import diagnostics
 import i18n
 from settings import (DEFAULT_HOTKEYS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
                       MULTIPLIER_MIN, MULTIPLIER_STEP, SettingsStore)
@@ -80,6 +81,34 @@ def capture_interval(target_fps, multiplier):
         multiplier = 2
     rate = (target_fps / multiplier) if target_fps and target_fps > 0 else (30.0 / multiplier)
     return 1.0 / rate if rate > 0 else 1.0
+
+
+# Generation may use at most this share of the capture interval; the rest is
+# headroom for capture, queueing and display, which must never be starved.
+GENERATION_BUDGET_RATIO = 0.9
+# An engine slower than this cannot generate frames for a real-time overlay.
+SLOW_ENGINE_MS = 250.0
+
+
+def affordable_timesteps(timesteps, budget_ms, inference_ms):
+    """Keep the intermediate frames that fit in the time before the next capture.
+
+    A generator that is slower than the capture rate must not queue stale frames:
+    it is better to show only real frames (always fresh) than a slideshow of old
+    interpolated ones. ``inference_ms`` is unknown at first, so everything fits.
+    """
+    if not timesteps:
+        return []
+    if inference_ms is None or inference_ms <= 0:
+        return list(timesteps)
+    count = int(budget_ms // inference_ms) if budget_ms > 0 else 0
+    if count >= len(timesteps):
+        return list(timesteps)
+    if count <= 0:
+        return []
+    step = len(timesteps) / count
+    picked = {timesteps[min(len(timesteps) - 1, int(index * step))] for index in range(count)}
+    return sorted(picked)
 
 
 def put_latest(target_queue, item):
@@ -156,56 +185,87 @@ HUD_GAP = 8
 HUD_CHIP_PADDING = 16
 
 
-def hud_chips(fsr_on, ai_on, ultra_smooth, live=False):
+def hud_chips(fsr_on, ai_on, ultra_smooth, live=False, generated_fps=None):
     """Status chips for the overlay panel, as (label, value, color key).
 
     ``live`` marks frames that came straight from the capture because the pipeline
-    could not keep up, so the panel says where the image is coming from.
+    could not keep up, so the panel says where the image is coming from and how
+    many frames per second the generator is actually delivering.
     """
     mode = i18n.translate("hud.smooth") if ultra_smooth else i18n.translate("hud.standard")
+    source = i18n.translate("hud.live") if live else i18n.translate("hud.generated")
+    if generated_fps is not None and (generated_fps >= 1 or not live):
+        source = f"{source} {round(generated_fps)}/s"
     return [
         ("FSR", "ON" if fsr_on else "OFF", "on" if fsr_on else "off"),
         ("AI", "ON" if ai_on else "OFF", "on" if ai_on else "off"),
         (i18n.translate("hud.mode"), mode, "mode" if ultra_smooth else "off"),
-        ("", i18n.translate("hud.live") if live else i18n.translate("hud.generated"),
-         "mode" if live else "on"),
+        ("", source, "mode" if live else "on"),
     ]
 
 
 def processing_subroutine(capture_queue, process_queue, engine_config, stop_event):
     """
     Standalone subroutine for multiprocessing.
+
+    It generates the intermediate frames between two captures, but never more
+    than the hardware can afford: when the engine is slower than the capture
+    rate, generating anyway would only queue stale frames that the overlay has
+    to throw away.
     """
     from engine import RIFEEngine, RIFEONNXEngine
     import cv2
-    # The overlay must win over background work while a game is running.
+
+    # Generation is best effort: it must never take CPU from the game or from the
+    # overlay's display loop, which is the part the player actually looks at.
     try:
         import psutil
-        psutil.Process().nice(psutil.HIGH_PRIORITY_CLASS)
+        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
     except Exception:
         pass
 
-    # Initialize engine inside the process
-    if engine_config.get("engine_type") == "AI (RIFE ONNX)":
-        engine = RIFEONNXEngine()
-    else:
-        engine = RIFEEngine()
-        
-    if hasattr(engine, 'set_high_precision'):
-        engine.set_high_precision(engine_config.get("ultra_smooth", False))
+    engine_type = engine_config.get("engine_type")
+    ultra_smooth = engine_config.get("ultra_smooth", False)
+
+    def build_engine(kind):
+        created = RIFEONNXEngine() if kind == "AI (RIFE ONNX)" else RIFEEngine()
+        if hasattr(created, "set_high_precision"):
+            created.set_high_precision(ultra_smooth)
+        return created
+
+    def describe(created, kind):
+        session = getattr(created, "session", None)
+        if session is None:
+            return kind, ""
+        try:
+            return kind, " · ".join(session.get_providers())
+        except Exception:
+            return kind, ""
+
+    engine = build_engine(engine_type)
+    used_engine, providers = describe(engine, engine_type)
+    diagnostics.write_now("motor", f"{used_engine} iniciado no worker (PID {os.getpid()}){f' [{providers}]' if providers else ''}")
+    if engine_type == "AI (RIFE ONNX)" and providers and not any(
+            name in providers for name in ("DmlExecutionProvider", "CUDAExecutionProvider")):
+        diagnostics.write_now("motor", "RIFE está rodando na CPU; a geração de frames será lenta. "
+                                       "Instale onnxruntime-directml ou use o motor Fast (DIS Flow).")
 
     fg_enabled = engine_config.get("fg_enabled", True)
     internal_res = engine_config.get("internal_res", (800, 600))
     multiplier = max(1, int(engine_config.get("frame_multiplier", 2) or 2))
-    timesteps = interpolation_timesteps(multiplier) if fg_enabled else []
+    requested = interpolation_timesteps(multiplier) if fg_enabled else []
     last_frame = None
+    last_capture_time = None
+    arrival_ms = 0.0      # smoothed interval between captures
+    inference_ms = 0.0    # smoothed cost of one interpolation
     generated = 0
     dropped = 0
+    skipped = 0
     report_time = time.perf_counter()
-    inference_ms = 0.0
+    slow_engine_checked = False
 
     print(f"Sub-process processing worker started (PID: {os.getpid()}, frame gen x{multiplier})")
-    
+
     while not stop_event.is_set():
         try:
             # We use a small timeout to check the stop_event periodically
@@ -213,16 +273,43 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
         except Exception:
             continue
         try:
+            now = time.perf_counter()
+            if last_capture_time is not None:
+                gap = (now - last_capture_time) * 1000.0
+                arrival_ms = gap if arrival_ms <= 0 else arrival_ms * 0.8 + gap * 0.2
+            last_capture_time = now
+
             # Safety net: the capture worker already scales frames down.
             h, w = current_frame.shape[:2]
             if w > internal_res[0] or h > internal_res[1]:
                 current_frame = cv2.resize(current_frame, internal_res, interpolation=cv2.INTER_LINEAR)
 
+            timesteps = affordable_timesteps(requested, arrival_ms * GENERATION_BUDGET_RATIO, inference_ms)
+            if requested and last_frame is not None and not timesteps:
+                skipped += 1
+
             if timesteps and last_frame is not None:
-                for timestep in timesteps:
+                index = 0
+                while index < len(timesteps):
+                    timestep = timesteps[index]
                     started = time.perf_counter()
                     generated_frame = engine.interpolate(last_frame, current_frame, timestep)
-                    inference_ms += (time.perf_counter() - started) * 1000.0
+                    spent = (time.perf_counter() - started) * 1000.0
+                    inference_ms = spent if inference_ms <= 0 else inference_ms * 0.8 + spent * 0.2
+                    if not slow_engine_checked and spent >= SLOW_ENGINE_MS and engine_type == "AI (RIFE ONNX)":
+                        slow_engine_checked = True
+                        diagnostics.write_now("motor", f"{used_engine} levou {spent:.0f} ms por quadro "
+                                                       f"(nenhuma GPU/DirectML disponível): trocando para o "
+                                                       f"motor Fast (DIS Flow) nesta sessão")
+                        engine = build_engine("Fast (DIS Flow)")
+                        used_engine, providers = describe(engine, "Fast (DIS Flow)")
+                        inference_ms = 0.0
+                        # The remaining frames of this pair fit again with the faster engine.
+                        timesteps = affordable_timesteps(requested, arrival_ms * GENERATION_BUDGET_RATIO,
+                                                         inference_ms)
+                        index = 0
+                        continue
+                    index += 1
                     if not put_latest(process_queue, generated_frame):
                         dropped += 1
                     generated += 1
@@ -230,17 +317,23 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
                 dropped += 1
             last_frame = current_frame
 
-            now = time.perf_counter()
-            if now - report_time >= 5.0:
-                rate = generated / (now - report_time)
-                average = inference_ms / generated if generated else 0.0
-                print(f"[frame gen] {rate:5.1f} frames/s  ·  {average:5.1f} ms por frame"
-                      f"  ·  {dropped} descartados")
-                generated = dropped = 0
-                inference_ms = 0.0
-                report_time = now
-        except Exception:
+            report_time_now = time.perf_counter()
+            if report_time_now - report_time >= 5.0:
+                elapsed = report_time_now - report_time
+                rate = generated / elapsed
+                average = inference_ms
+                message = (f"{rate:5.1f} frames gerados/s · inferência {average:5.1f} ms · "
+                           f"capturas a cada {arrival_ms:4.1f} ms · {dropped} descartados")
+                if skipped:
+                    message += f" · {skipped} pares sem interpolação (orçamento estourado)"
+                print(f"[frame gen] {message}")
+                diagnostics.write_now("geração", message)
+                generated = dropped = skipped = 0
+                report_time = report_time_now
+        except Exception as exc:
+            diagnostics.write_now("geração", f"erro no worker: {exc}")
             continue
+
 
 class FrameGenerationApp:
     def __init__(self, target_fps=60):
@@ -260,8 +353,17 @@ class FrameGenerationApp:
         self.start_time = 0
         self.current_fps = 0
         self.live_fallback = False
-        # Newest captured frame, at processing resolution, for the degraded mode.
-        self.live_queue = Queue(maxsize=1)
+        # Newest capture, already prepared for the display, used while the
+        # generator is behind so the overlay keeps the game's own frame rate.
+        self.live_display_queue = Queue(maxsize=1)
+        self.last_live_display = None
+        self.live_publish_time = 0.0
+        self.want_live_frames = False
+        self.starving_since = None
+        self.healthy_since = None
+        self.generated_fps = 0.0
+        self.dropped_generated = 0
+        self.last_frame_generated = False
         
         # Window & Performance management
         self.last_rect = None
@@ -328,7 +430,12 @@ class FrameGenerationApp:
 
                     if not is_duplicate:
                         last_frame = frame
-                        put_latest(self.live_queue, frame)
+                        # Prepare a display-ready copy for the fallback path: while the
+                        # generator is behind, LIVE frames must look like generated ones.
+                        now_publish = time.perf_counter()
+                        if self.want_live_frames or now_publish - self.live_publish_time >= 0.2:
+                            self.live_publish_time = now_publish
+                            self._publish_live_frame(frame)
                         put_latest(self.capture_queue, frame)
         finally:
             # Release DXGI/GDI resources on the same worker that used them.
@@ -343,21 +450,104 @@ class FrameGenerationApp:
             frame = cv2.resize(frame, (max_w, max_h), interpolation=cv2.INTER_LINEAR)
         return frame
 
-    def _take_live_frame(self):
-        """Newest captured frame, used when the pipeline cannot keep up."""
-        frame = None
+    def _publish_live_frame(self, frame):
+        """Prepare a captured frame exactly like a generated one, for the fallback path.
+
+        It goes through the same sharpening and upscale as a generated frame, so the
+        image does not change look when the two sources swap.
+        """
+        try:
+            display = self._render_for_display(frame)
+        except Exception as exc:
+            diagnostics.write_now("exibição", f"falha ao preparar frame ao vivo: {exc}")
+            return
+        put_latest(self.live_display_queue, display)
+
+    def _newest_live_frame(self):
+        """Newest prepared capture; repeats the previous one instead of showing nothing."""
         while True:
             try:
-                frame = self.live_queue.get_nowait()
+                self.last_live_display = self.live_display_queue.get_nowait()
             except Empty:
-                return frame
+                return self.last_live_display
 
-    def post_processing_worker(self):
+    def _pick_frame(self, now, min_buffer, stall_timeout, return_delay):
+        """Show the newest frame available, from the generator or from the capture.
+
+        Both paths are prepared exactly the same way, so a change of source is not
+        visible in the image. What changes is the HUD chip, and that one only moves
+        after a sustained stall or a sustained recovery: flipping it frame by frame
+        is what made the panel look like it was flickering.
+        """
+        frame = None
+        from_generator = False
+        # Never display a backlog: if the generator produced more frames than the
+        # overlay showed, the oldest ones are already out of date.
+        while self.display_queue.qsize() > max(1, min_buffer):
+            try:
+                self.display_queue.get_nowait()
+                self.dropped_generated += 1
+            except Empty:
+                break
+        if self.display_queue.qsize() >= min_buffer or self.frame_count == 0:
+            try:
+                frame = self.display_queue.get_nowait()
+                from_generator = frame is not None
+            except Empty:
+                frame = None
+        if frame is None:
+            # Nothing generated is ready: the newest capture keeps the image moving.
+            frame = self._newest_live_frame()
+
+        if from_generator:
+            self.starving_since = None
+            if self.live_fallback:
+                if self.healthy_since is None:
+                    self.healthy_since = now
+                elif now - self.healthy_since >= return_delay:
+                    self.live_fallback = False
+                    self.healthy_since = None
+                    print("Frame generation is keeping up again.")
+                    diagnostics.write_now("exibição", "geração voltou a acompanhar o ritmo (FG)")
+        else:
+            self.healthy_since = None
+            if self.starving_since is None:
+                self.starving_since = now
+            if not self.live_fallback and now - self.starving_since >= stall_timeout:
+                self.live_fallback = True
+                print("Frame generation cannot keep up: showing the live capture.")
+                diagnostics.write_now("exibição", "geração não acompanha o ritmo; "
+                                                  "exibindo a captura direta (LIVE)")
+
+        self.want_live_frames = self.live_fallback
+        self.last_frame_generated = from_generator
+        return frame
+
+    def _render_for_display(self, frame):
         """Sharpen at the processing resolution, then upscale once for the display.
 
         Sharpening before the upscale is the difference between a few milliseconds
         and tens of milliseconds per frame on a 1080p or larger display.
         """
+        needs_upscale = (frame.shape[1], frame.shape[0]) != self.display_dim
+        if self.ai_mode and self.ai_upscaler:
+            frame = self.ai_upscaler.upscale(frame)
+            if (frame.shape[1], frame.shape[0]) != self.display_dim:
+                frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
+        elif self.fsr_mode:
+            if self.sharpness > 0:
+                frame = AMDFilters.apply_cas(frame, self.sharpness)
+            if needs_upscale:
+                frame = AMDFilters.apply_easu(frame, self.display_dim)
+        else:
+            if self.sharpness > 0:
+                frame = AMDFilters.apply_unsharp(frame, self.sharpness)
+            if needs_upscale:
+                frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
+        return frame
+
+    def post_processing_worker(self):
+        """Prepare every generated frame for the display."""
         print("Post-processing worker started")
         while self.running:
             try:
@@ -365,25 +555,10 @@ class FrameGenerationApp:
             except Empty:
                 continue
             try:
-                needs_upscale = (frame.shape[1] != self.display_dim[0]
-                                 or frame.shape[0] != self.display_dim[1])
-                if self.ai_mode and self.ai_upscaler:
-                    frame = self.ai_upscaler.upscale(frame)
-                    if (frame.shape[1], frame.shape[0]) != self.display_dim:
-                        frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
-                elif self.fsr_mode:
-                    if self.sharpness > 0:
-                        frame = AMDFilters.apply_cas(frame, self.sharpness)
-                    if needs_upscale:
-                        frame = AMDFilters.apply_easu(frame, self.display_dim)
-                else:
-                    if self.sharpness > 0:
-                        frame = AMDFilters.apply_unsharp(frame, self.sharpness)
-                    if needs_upscale:
-                        frame = cv2.resize(frame, self.display_dim, interpolation=self.upscale_algo)
-                put_latest(self.display_queue, frame)
+                put_latest(self.display_queue, self._render_for_display(frame))
             except Exception as exc:
                 print(f"Post-processing error: {exc}")
+                diagnostics.write_now("exibição", f"erro no pós-processamento: {exc}")
 
     def select_game(self):
         ui = GameSelectorUI()
@@ -482,10 +657,19 @@ class FrameGenerationApp:
               f"{self.hotkey_names['fsr']} to toggle FSR.")
         return True
 
-    def _hud_parts(self, font, small_font):
+    def _hud_chip_texts(self, small_font, show_rate):
+        chips = []
+        for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth,
+                                             live=self.live_fallback,
+                                             generated_fps=self.generated_fps if show_rate else None):
+            chips.append((HUD_COLORS[state], small_font.render(f"{label} {value}".strip(), True,
+                                                              HUD_COLORS[state])))
+        return chips
+
+    def _hud_parts(self, font, small_font, max_width=None):
         """Render the panel once per status change, not once per displayed frame."""
         key = (round(self.current_fps), self.fsr_mode, self.ai_mode, self.ultra_smooth,
-               self.live_fallback, i18n.get_language())
+               self.live_fallback, round(self.generated_fps), i18n.get_language(), max_width)
         cached = getattr(self, "_hud_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -493,12 +677,15 @@ class FrameGenerationApp:
         fps_label = small_font.render("FPS", True, HUD_COLORS["muted"])
         hint = small_font.render(f"{self.hotkey_names['stop']}  {i18n.translate('hud.menu')}",
                                  True, HUD_COLORS["muted"])
-        chips = []
-        for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth,
-                                             live=self.live_fallback):
-            color = HUD_COLORS[state]
-            text = small_font.render(f"{label} {value}".strip(), True, color)
-            chips.append((color, text))
+        chips = self._hud_chip_texts(small_font, show_rate=True)
+        if max_width is not None:
+            # Small windows: drop the generation rate before the panel overflows.
+            widest = max(sum(text.get_width() + HUD_CHIP_PADDING for _, text in chips)
+                         + HUD_GAP * max(0, len(chips) - 1),
+                         fps_value.get_width() + HUD_GAP + fps_label.get_width(),
+                         hint.get_width())
+            if widest + HUD_PADDING * 2 > max_width:
+                chips = self._hud_chip_texts(small_font, show_rate=False)
 
         chip_widths = [text.get_width() + HUD_CHIP_PADDING for _, text in chips]
         chip_height = max([text.get_height() for _, text in chips] + [0]) + HUD_GAP
@@ -521,7 +708,8 @@ class FrameGenerationApp:
     def _draw_hud(self, screen, font, small_font):
         """Rounded translucent status panel: FPS, state chips and the F11 hint."""
         (panel, fps_value, fps_label, hint,
-         chips, chip_widths, chip_height, chip_backgrounds) = self._hud_parts(font, small_font)
+         chips, chip_widths, chip_height, chip_backgrounds) = self._hud_parts(
+            font, small_font, max_width=max(0, screen.get_width() - 32))
         panel_width, panel_height = panel.get_width(), panel.get_height()
         screen.blit(panel, (16, 16))
         pygame.draw.rect(screen, HUD_COLORS["border"], (16, 16, panel_width, panel_height),
@@ -622,15 +810,23 @@ class FrameGenerationApp:
         t_post.start()
         
         frame_interval = 1.0 / self.target_fps
-        # If the pipeline is behind, fall back to the newest captured frame instead
-        # of freezing on the last generated one.
-        stall_timeout = max(0.05, frame_interval * 3)
+        # The generator needs to miss a whole frame before LIVE frames take over, and
+        # it has to prove it recovered before generated frames come back. Without the
+        # second delay the two sources alternate every frame, which the eye reads as
+        # flicker.
+        stall_timeout = max(frame_interval * 2, 0.03)
+        return_delay = max(stall_timeout * 3, 0.3)
         last_display_time = time.perf_counter()
-        last_frame_time = last_display_time
         fps_window_start = last_display_time
         fps_window_frames = 0
+        generated_window = 0
         diagnostics_time = last_display_time
         self.sync_counter = 0
+        diagnostics.reset()
+        diagnostics.write_now("início", f"overlay {self.display_dim[0]}x{self.display_dim[1]} · "
+                                        f"interno {self.internal_res[0]}x{self.internal_res[1]} · "
+                                        f"{self.target_fps} FPS · geração x{self.frame_multiplier} · "
+                                        f"motor {self.target_source.get('engine_type')}")
 
         try:
             while self.running:
@@ -648,44 +844,46 @@ class FrameGenerationApp:
                 # pipeline reports (and shows) the real rate instead of a stale value.
                 loop_now = time.perf_counter()
                 if loop_now - fps_window_start >= 0.5:
-                    self.current_fps = fps_window_frames / (loop_now - fps_window_start)
+                    window = loop_now - fps_window_start
+                    self.current_fps = fps_window_frames / window
+                    self.generated_fps = generated_window / window
                     fps_window_frames = 0
+                    generated_window = 0
                     fps_window_start = loop_now
                     if loop_now - diagnostics_time >= 5.0:
                         diagnostics_time = loop_now
                         source = "live" if self.live_fallback else "generated"
+                        queue_size = self.display_queue.qsize()
                         print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
-                              f"fila {self.display_queue.qsize()}  ·  {source}"
-                              f"  ·  captura {self.frame_multiplier}x")
+                              f"{self.generated_fps:5.1f} frames gerados/s  ·  fila {queue_size}  ·  "
+                              f"{source}  ·  captura {self.frame_multiplier}x")
+                        diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
+                                                           f"{self.generated_fps:5.1f} gerados/s · "
+                                                           f"filas captura {self.capture_queue.qsize()}"
+                                                           f"/{self.capture_queue.maxsize} · pós "
+                                                           f"{self.process_queue.qsize()}"
+                                                           f"/{self.process_queue.maxsize} · exibição "
+                                                           f"{queue_size}/{self.display_queue.maxsize} · "
+                                                           f"{source} · {self.dropped_generated} descartados")
 
-                # Precision Pacing Logic
-                now = time.perf_counter()
-                if now - last_display_time < frame_interval:
-                    # Busy-wait for the last 1ms for sub-ms precision
-                    if frame_interval - (now - last_display_time) < 0.001:
-                        pass # Busy wait
-                    else:
-                        time.sleep(0.0005)
+                # Precision pacing: sleep the bulk of the wait and spin only the
+                # last two milliseconds. Windows rounds short sleeps up to its timer
+                # resolution, and a 0.5 ms sleep that lasts 15 ms is visible as jitter.
+                wait = frame_interval - (time.perf_counter() - last_display_time)
+                if wait > 0.002:
+                    time.sleep(wait - 0.002)
                     continue
+                if wait > 0:
+                    continue  # busy wait: shorter than the timer resolution
 
                 # Buffer check: wait for at least 2 frames to be ready to absorb jitter
                 # in Low Latency mode, we are more aggressive
+                now = time.perf_counter()
                 min_buffer = 1 if self.low_latency else 3
-                frame = None
-                if self.display_queue.qsize() >= min_buffer or self.frame_count == 0:
-                    try:
-                        frame = self.display_queue.get_nowait()
-                    except Empty:
-                        frame = None
-                if frame is not None:
-                    self.live_fallback = False
-                elif self.frame_count > 0 and now - last_frame_time >= stall_timeout:
-                    frame = self._take_live_frame()
-                    self.live_fallback = frame is not None
+                frame = self._pick_frame(now, min_buffer, stall_timeout, return_delay)
 
                 if frame is not None:
                     last_display_time = now
-                    last_frame_time = now
                     
                     # Window sync: checking 15 times a second is enough to follow
                     # moves and resizes without paying for it on every frame.
@@ -760,6 +958,8 @@ class FrameGenerationApp:
                     
                     self.frame_count += 1
                     fps_window_frames += 1
+                    if self.last_frame_generated:
+                        generated_window += 1
                 else:
                     time.sleep(0.0005)
 
