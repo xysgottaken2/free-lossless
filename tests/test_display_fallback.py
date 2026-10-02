@@ -251,4 +251,82 @@ class QueueReportTests(unittest.TestCase):
         import inspect
         source = inspect.getsource(self.module.FrameGenerationApp.run)
         self.assertNotIn(".maxsize", source)
-        self.assertIn("_queue_report", source)
+        self.assertIn("_log_periodic_status", source)
+
+    def test_no_direct_queue_attribute_access_survives_anywhere(self):
+        """``.maxsize`` may only be read through ``queue_capacity``.
+
+        Checked on the syntax tree, not on the text: a docstring that mentions the
+        attribute is fine, an access is not.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        def attribute_names(source):
+            tree = ast.parse(textwrap.dedent(source))
+            return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+        for name in ("run", "_log_periodic_status", "_queue_report"):
+            with self.subTest(method=name):
+                attributes = attribute_names(inspect.getsource(getattr(self.module.FrameGenerationApp, name)))
+                self.assertNotIn("maxsize", attributes)
+
+
+class PeriodicReportTests(unittest.TestCase):
+    """The periodic status report is cosmetic: it must never stop the overlay."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+
+    def setUp(self):
+        self.messages = []
+        self.original = self.module.diagnostics.write_now
+        self.module.diagnostics.write_now = lambda label, message: self.messages.append(
+            f"{label}: {message}")
+        self.addCleanup(setattr, self.module.diagnostics, "write_now", self.original)
+        self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.current_fps = 118.6
+        self.app.generated_fps = 118.6
+        self.app.live_fallback = False
+        self.app.frame_multiplier = 2
+        self.app.dropped_generated = 0
+        self.app.display_queue = Queue(maxsize=5)
+        self.app.display_queue.put("frame")
+        self.app._queue_report = lambda size=None: "filas teste"
+
+    def test_nothing_is_written_before_the_interval(self):
+        self.assertEqual(self.app._log_periodic_status(1.0, 0.0), 0.0)
+        self.assertEqual(self.messages, [])
+
+    def test_the_timestamp_advances_when_it_reports(self):
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("FPS exibidos" in message for message in self.messages))
+
+    def test_a_broken_report_does_not_raise_and_keeps_the_schedule(self):
+        self.app._queue_report = lambda size=None: 1 / 0
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))
+
+
+
+    def test_the_log_says_where_the_frames_came_from(self):
+        self.app.live_fallback = True
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertTrue(any("live" in message for message in self.messages))
+
+    def test_the_report_reads_the_real_display_queue(self):
+        """The queue size is measured inside the report, not passed by the caller."""
+        self.app.__dict__.pop("_queue_report", None)      # use the real method
+        self.app.capture_queue = Queue(maxsize=2)
+        self.app.process_queue = Queue(maxsize=3)
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertTrue(any("exibição 1/5" in message for message in self.messages))
+
+    def test_a_broken_queue_is_reported_and_the_schedule_continues(self):
+        self.app.display_queue = object()          # no qsize() at all
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))

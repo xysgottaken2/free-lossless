@@ -603,6 +603,35 @@ class FrameGenerationApp:
         self.last_frame_generated = from_generator
         return frame
 
+    PERIODIC_REPORT_SECONDS = 5.0
+
+    def _log_periodic_status(self, loop_now, diagnostics_time):
+        """Every few seconds: shown FPS, generation rate, queue occupancy, frame source.
+
+        Cosmetic by nature — and it has already taken the overlay down once (a
+        ``multiprocessing.Queue`` has no ``.maxsize``), so the whole thing sits behind a
+        guard and the timestamp is always returned, logged or not.
+        """
+        if loop_now - diagnostics_time < self.PERIODIC_REPORT_SECONDS:
+            return diagnostics_time
+        try:
+            source = "live" if self.live_fallback else "generated"
+            queue_size = self.display_queue.qsize()
+            print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
+                  f"{self.generated_fps:5.1f} frames gerados/s  ·  fila {queue_size}  ·  "
+                  f"{source}  ·  captura {self.frame_multiplier}x")
+            diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
+                                               f"{self.generated_fps:5.1f} gerados/s · "
+                                               f"{self._queue_report(queue_size)} · "
+                                               f"{source} · {self.dropped_generated} descartados")
+        except Exception as exc:
+            # Write directly: the report itself is what failed.
+            try:
+                diagnostics.write_now("exibição", f"relatório periódico falhou: {exc}")
+            except Exception:
+                pass
+        return loop_now
+
     def _queue_report(self, display_size=None):
         """One line about queue occupancy, for the periodic diagnostics log."""
         if display_size is None:
@@ -1101,17 +1130,7 @@ class FrameGenerationApp:
                     fps_window_frames = 0
                     generated_window = 0
                     fps_window_start = loop_now
-                    if loop_now - diagnostics_time >= 5.0:
-                        diagnostics_time = loop_now
-                        source = "live" if self.live_fallback else "generated"
-                        queue_size = self.display_queue.qsize()
-                        print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
-                              f"{self.generated_fps:5.1f} frames gerados/s  ·  fila {queue_size}  ·  "
-                              f"{source}  ·  captura {self.frame_multiplier}x")
-                        diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
-                                                           f"{self.generated_fps:5.1f} gerados/s · "
-                                                           f"{self._queue_report(queue_size)} · "
-                                                           f"{source} · {self.dropped_generated} descartados")
+                    diagnostics_time = self._log_periodic_status(loop_now, diagnostics_time)
 
                 # Precision pacing: sleep the bulk of the wait and spin only the
                 # last two milliseconds. Windows rounds short sleeps up to its timer
