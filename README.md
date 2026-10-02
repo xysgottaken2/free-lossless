@@ -338,6 +338,32 @@ Cada sessão do overlay grava um resumo em `overlay.log`, na mesma pasta do arqu
 preferências (`%LOCALAPPDATA%\FreeLossless` no Windows). O log registra resolução
 interna, FPS exibidos, frames gerados por segundo, fila e cada troca de fonte.
 
+## Se o app não abrir ("o arquivo de paginação é muito pequeno")
+
+O Windows pode recusar carregar uma DLL grande quando o **limite de memória
+comprometida** do sistema foi atingido. A mensagem que aparece nesse caso é
+`DLL load failed while importing cv2: O arquivo de paginação é muito pequeno para que
+esta operação seja concluída` (erro 1455 do Windows) — é uma condição do sistema, não do
+app: costuma acontecer com o navegador cheio de abas aberto, outro jogo rodando, ou um
+arquivo de paginação que algum guia de "otimização" desativou.
+
+O que o app faz agora:
+
+- **Tenta de novo**: o carregamento é repetido até 3 vezes, com 1,5 s de intervalo. A
+  pressão de memória normalmente passa nesse tempo e o app abre sozinho (a tela de
+  abertura fica visível durante as tentativas).
+- **Explica em vez de morrer em silêncio**: se as três tentativas falharem, aparece uma
+  janela no idioma salvo dizendo qual módulo falhou, a mensagem do Windows, quanta RAM e
+  memória virtual havia no momento, e o passo a passo para aumentar a memória virtual.
+- **Registra tudo**: `overlay.log` (mesma pasta das preferências) recebe a linha do erro,
+  os números de memória e o traceback completo.
+
+Se acontecer com frequência, aumente a memória virtual do Windows: **Configurações →
+Sistema → Sobre → Configurações avançadas do sistema → Desempenho → Configurações →
+Avançado → Memória virtual → Alterar**, deixe *"Gerenciar automaticamente o tamanho do
+arquivo de paginação"* ligado (ou defina um tamanho maior) e reinicie. Fechar o navegador
+antes de abrir o app também resolve no caso mais comum.
+
 ## Setup Guide (developers / running from source)
 
 ### 1. Create a Virtual Environment

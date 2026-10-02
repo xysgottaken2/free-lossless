@@ -47,6 +47,25 @@ _TRANSLATIONS = {
         "section.advanced": "ADVANCED",
         "field.capture_backend": "Capture backend",
         "field.output_scale": "Output scale",
+        "crash.failed_title": "Free Lossless stopped",
+        "crash.failed_body": ("Free Lossless hit an error and had to close.\n\n"
+                              "{error}\n\n"
+                              "{memory}\n\n"
+                              "Full details (with the traceback) were written to:\n{log}"),
+        "startup.failed_title": "Free Lossless could not start",
+        "startup.failed_body": ("Free Lossless could not load {module} and did not start.\n\n"
+                                "{error}\n\n"
+                                "{memory}\n\n"
+                                "If the message mentions the paging file, raise the Windows virtual "
+                                "memory: Settings > System > About > Advanced system settings > "
+                                "Performance > Settings > Advanced > Virtual memory > Change, keep "
+                                "\"Automatically manage paging file size\" on (or set a larger size), "
+                                "then restart. Closing heavy programs (browser, other games) also frees "
+                                "the memory Windows needs.\n\n"
+                                "It is worth trying again: the app retries the load "
+                                "{attempts} times before giving up, and it usually works once the "
+                                "machine has room.\n\n"
+                                "Full details (with the traceback) were written to:\n{log}"),
         "field.output_fps": "Output FPS",
         "fps.unlimited": "Unlimited (no vsync)",
         "fps.unlimited_value": "Unlimited",
@@ -207,6 +226,25 @@ _TRANSLATIONS = {
         "section.advanced": "AJUSTES AVANÇADOS",
         "field.capture_backend": "Backend de captura",
         "field.output_scale": "Escala de saída",
+        "crash.failed_title": "O Free Lossless parou",
+        "crash.failed_body": ("O Free Lossless encontrou um erro e precisou fechar.\n\n"
+                              "{error}\n\n"
+                              "{memory}\n\n"
+                              "Os detalhes completos (com o traceback) foram gravados em:\n{log}"),
+        "startup.failed_title": "O Free Lossless não conseguiu iniciar",
+        "startup.failed_body": ("O Free Lossless não conseguiu carregar {module} e não iniciou.\n\n"
+                                "{error}\n\n"
+                                "{memory}\n\n"
+                                "Se a mensagem falar do arquivo de paginação, aumente a memória "
+                                "virtual do Windows: Configurações > Sistema > Sobre > Configurações "
+                                "avançadas do sistema > Desempenho > Configurações > Avançado > Memória "
+                                "virtual > Alterar, deixe \"Gerenciar automaticamente o tamanho do "
+                                "arquivo de paginação\" ligado (ou defina um tamanho maior) e reinicie. "
+                                "Fechar programas pesados (navegador, outros jogos) também libera a "
+                                "memória de que o Windows precisa.\n\n"
+                                "Vale tentar de novo: o app tenta carregar {attempts} vezes antes de "
+                                "desistir, e costuma dar certo quando a máquina tem folga.\n\n"
+                                "Os detalhes completos (com o traceback) foram gravados em:\n{log}"),
         "field.output_fps": "FPS de saída",
         "fps.unlimited": "Ilimitado (sem vsync)",
         "fps.unlimited_value": "Ilimitado",
@@ -366,6 +404,21 @@ _TRANSLATIONS = {
         "section.advanced": "高级设置",
         "field.capture_backend": "捕获后端",
         "field.output_scale": "输出缩放",
+        "crash.failed_title": "Free Lossless 已停止",
+        "crash.failed_body": ("Free Lossless 遇到错误，只能关闭。\n\n"
+                              "{error}\n\n"
+                              "{memory}\n\n"
+                              "完整信息（含调试堆栈）已写入：\n{log}"),
+        "startup.failed_title": "Free Lossless 无法启动",
+        "startup.failed_body": ("Free Lossless 无法加载 {module}，启动失败。\n\n"
+                                "{error}\n\n"
+                                "{memory}\n\n"
+                                "如果提示与分页文件有关，请增大 Windows 虚拟内存：设置 > 系统 > 关于 > "
+                                "高级系统设置 > 性能 > 设置 > 高级 > 虚拟内存 > 更改，保持“自动管理分页文件"
+                                "大小”（或设置更大的值），然后重启电脑。关闭占用较大的程序（浏览器、其他"
+                                "游戏）也能释放 Windows 所需的内存。\n\n"
+                                "可以再试一次：应用在放弃前会重试 {attempts} 次，机器有余量时通常就能成功。\n\n"
+                                "完整信息（含调试堆栈）已写入：\n{log}"),
         "field.output_fps": "输出帧率",
         "fps.unlimited": "无限制（关闭垂直同步）",
         "fps.unlimited_value": "无限制",

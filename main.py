@@ -1,8 +1,11 @@
 import ctypes
+import gc
 import multiprocessing
 import os
+import re
 import threading
 import time
+import traceback
 from queue import Empty, Full, Queue
 
 try:  # Tk is only needed for the error dialog, and it is missing on some Linux boxes.
@@ -31,18 +34,44 @@ create_display = D3D11 = None
 win32gui = win32con = win32api = None
 
 
+# Windows refuses to map a large DLL when the system commit limit is reached, with
+# "the paging file is too small for this operation to complete". It happens with a
+# browser full of tabs open, a pagefile that a tuning guide disabled, or simply a small
+# machine — and it is usually gone a moment later. The import is retried before the app
+# gives up, and giving up means explaining the failure instead of a raw traceback: the
+# windowed build has no console, so a traceback there is invisible.
+STARTUP_IMPORT_ATTEMPTS = 3
+STARTUP_RETRY_SECONDS = 1.5
+
+
+class RuntimeLoadError(RuntimeError):
+    """A module the overlay needs could not be imported after every attempt."""
+
+    def __init__(self, module_name, error):
+        super().__init__(f"{module_name}: {error}")
+        self.module_name = module_name
+        self.error = error
+
+
+def _failing_module(error):
+    """Best-effort name of the module an ImportError came from."""
+    name = getattr(error, "name", None)
+    if name:
+        return str(name)
+    match = re.search(r"importing ([A-Za-z_][\w.]*)", str(error))
+    return match.group(1) if match else "?"
+
+
 def runtime_loaded():
     return pygame is not None
 
 
-def load_runtime():
-    """Import the overlay dependencies. Calling it twice is harmless."""
+def _import_runtime():
+    """The heavy imports themselves, in one place so they can be retried."""
     global cv2, np, pygame, ScreenCapture, RIFEEngine, RIFEONNXEngine, GameSelectorUI
     global get_source_rect, get_source_monitor_rect, AMDFilters, NvidiaAIUpscaler, EffectChain
     global create_display, D3D11
     global win32gui, win32con, win32api
-    if runtime_loaded():
-        return
     import cv2 as cv2_module
     import numpy as numpy_module
     import pygame as pygame_module
@@ -66,6 +95,35 @@ def load_runtime():
     create_display, D3D11 = display_factory, d3d11_mode
     get_source_rect, get_source_monitor_rect = source_rect_function, monitor_rect_function
     GameSelectorUI = selector_ui
+
+
+def load_runtime():
+    """Import the overlay dependencies, retrying a transient Windows failure.
+
+    Calling it twice is harmless. Each attempt imports everything again from scratch:
+    Python drops a module that failed to import, so a second try really does retry the
+    DLL that Windows refused to map.
+    """
+    if runtime_loaded():
+        return
+    last_error = None
+    for attempt in range(1, STARTUP_IMPORT_ATTEMPTS + 1):
+        try:
+            _import_runtime()
+            if attempt > 1:
+                diagnostics.write_now("início", f"carregado na tentativa {attempt}")
+            return
+        except ImportError as exc:
+            last_error = exc
+            gc.collect()
+            if attempt < STARTUP_IMPORT_ATTEMPTS:
+                diagnostics.write_now(
+                    "início",
+                    f"falha ao carregar {_failing_module(exc)} "
+                    f"(tentativa {attempt}/{STARTUP_IMPORT_ATTEMPTS}): {exc}")
+                time.sleep(STARTUP_RETRY_SECONDS)
+    raise RuntimeLoadError(_failing_module(last_error), last_error) from last_error
+
 
 # Window styles of the overlay. WS_EX_TRANSPARENT makes it click-through and
 # WS_EX_NOACTIVATE keeps Windows from giving it focus (Win key, Alt+Tab and game
@@ -1477,6 +1535,68 @@ def runtime_loader():
     load_runtime()
 
 
+def startup_memory_report():
+    """RAM and pagefile numbers: a Windows commit failure is about exactly these two."""
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        page = psutil.swap_memory()
+        return (f"RAM {memory.available / 2**30:.1f} GB livres de {memory.total / 2**30:.1f} GB · "
+                f"arquivo de paginação {page.used / 2**30:.1f} GB de {page.total / 2**30:.1f} GB")
+    except Exception as exc:  # pragma: no cover - psutil ships with the app
+        return f"informações de memória indisponíveis ({exc})"
+
+
+def _show_failure_dialog(title, body):
+    """Show a modal error through ctypes, which needs nothing the app may have failed to load.
+
+    The frozen build runs windowed, so a traceback printed on the way out is never
+    seen — which is how "it didn't open" becomes the only thing a user can report.
+    """
+    print(body)
+    try:
+        ctypes.windll.user32.MessageBoxW(None, body, title, 0x10)
+    except Exception:
+        pass  # no Windows dialog available: the log and the console already have it
+    return body
+
+
+def _log_failure(description, memory, traceback_text):
+    try:
+        diagnostics.write_now("início", description)
+        diagnostics.write(f"memória no momento da falha: {memory}")
+        if traceback_text:
+            diagnostics.write(traceback_text.rstrip())
+    except Exception:
+        pass
+
+
+def report_startup_failure(error, traceback_text=""):
+    """Explain a failed start in the user's language, and write the details to the log."""
+    if isinstance(error, RuntimeLoadError):
+        module, original = error.module_name, error.error
+    else:
+        module, original = i18n.translate("app.title"), error
+    memory = startup_memory_report()
+    _log_failure(f"inicialização falhou ao carregar {module}: {original}", memory, traceback_text)
+    body = i18n.translate("startup.failed_body", module=module, error=str(original), memory=memory,
+                          log=str(diagnostics.log_path()), attempts=STARTUP_IMPORT_ATTEMPTS)
+    return _show_failure_dialog(i18n.translate("startup.failed_title"), body)
+
+
+def report_crash(error, traceback_text=""):
+    """Something failed after the runtime loaded: say so instead of vanishing.
+
+    An exception anywhere in the menu or in an overlay session used to end the process
+    with nothing on screen. The log keeps the traceback; the dialog points at it.
+    """
+    memory = startup_memory_report()
+    _log_failure(f"erro inesperado: {error}", memory, traceback_text)
+    body = i18n.translate("crash.failed_body", error=str(error), memory=memory,
+                          log=str(diagnostics.log_path()))
+    return _show_failure_dialog(i18n.translate("crash.failed_title"), body)
+
+
 def main():
     multiprocessing.freeze_support()
     # Use physical pixel coordinates on mixed-DPI monitor layouts.
@@ -1495,13 +1615,23 @@ def main():
         print(f"Preferences unavailable ({exc}); using defaults")
         startup_settings = None
     i18n.set_language(startup_settings["language"] if startup_settings else None)
-    run_splash(runtime_loader)
-    while True:
-        app = FrameGenerationApp(target_fps=60)
-        if not app.run():
-            break
-        print("Waiting for next selection...")
-        time.sleep(0.5)
+    try:
+        run_splash(runtime_loader)
+    except Exception as exc:
+        # Never leave the user with a closed window and no explanation.
+        report_startup_failure(exc, traceback.format_exc())
+        return 1
+    try:
+        while True:
+            app = FrameGenerationApp(target_fps=60)
+            if not app.run():
+                break
+            print("Waiting for next selection...")
+            time.sleep(0.5)
+    except Exception as exc:
+        report_crash(exc, traceback.format_exc())
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
