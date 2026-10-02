@@ -285,6 +285,78 @@ def auto_resolution_scale(step):
     return AUTO_RESOLUTION_STEPS[step]
 
 
+# The overlay may take this much longer than the frame interval before it becomes the
+# ceiling itself; and a generator delivering less than its share is what makes the
+# displayed rate stop following the configured one.
+DISPLAY_WORK_TOLERANCE = 1.15
+GENERATOR_SHARE_TOLERANCE = 0.85
+
+
+def rate_diagnosis(displayed_fps, generated_fps, capture_fps, target_fps, multiplier,
+                   unlimited=False, work_ms=0.0):
+    """Say in one line what is capping the displayed rate, or None when nothing is.
+
+    "The FPS does not go past X" has three completely different causes — the game's own
+    rate, a generator that is not adding the intermediates, or an overlay that takes too
+    long per frame — and the log should tell them apart instead of making the user guess.
+    """
+    try:
+        multiplier = max(1, int(multiplier or 1))
+    except (TypeError, ValueError):
+        multiplier = 1
+    wanted = capture_fps * multiplier if unlimited else float(target_fps or 0)
+    if wanted <= 0 or displayed_fps >= wanted * 0.9:
+        return None
+    interval_ms = 1000.0 / wanted
+    if not unlimited and work_ms and work_ms > interval_ms * DISPLAY_WORK_TOLERANCE:
+        return (f"o overlay leva {work_ms:.1f} ms por quadro e o intervalo pedido é de "
+                f"{interval_ms:.1f} ms: a exibição está limitada pelo trabalho por quadro")
+    expected_share = wanted * (multiplier - 1) / multiplier
+    if multiplier > 1 and generated_fps < expected_share * GENERATOR_SHARE_TOLERANCE:
+        return (f"o gerador entrega {generated_fps:.0f} quadros/s e o ritmo pedido precisa de "
+                f"{expected_share:.0f}/s (x{multiplier}): o teto é a interpolação")
+    if unlimited and capture_fps > 0:
+        return (f"a captura entrega {capture_fps:.0f} quadros/s e o multiplicador x{multiplier} "
+                f"é aplicado sobre essa taxa: o teto é a taxa do jogo")
+    return None
+
+
+def even_multiplier(value):
+    """Nearest multiplier the menu offers (even, 2..20) for a ratio of rates."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return MULTIPLIER_MIN
+    step = max(1, int(MULTIPLIER_STEP))
+    rounded = int(round(value / step)) * step
+    return max(int(MULTIPLIER_MIN), min(int(MULTIPLIER_MAX), rounded))
+
+
+def capture_sync_hint(capture_fps, target_fps, multiplier, unlimited=False):
+    """Suggest the multiplier that puts the capture in step with the game's real rate.
+
+    With a fixed output rate the capture is scheduled at FPS / multiplier. When the game
+    runs *below* that rate, the extra captures see the same picture again: the generator
+    has nothing new to interpolate between, and the motion stays at the game's rate no
+    matter how high the output rate is. Matching the two is what makes interpolation
+    smooth — and in Unlimited mode it happens by itself.
+    """
+    if unlimited or not capture_fps or not target_fps:
+        return None
+    try:
+        multiplier = max(1, int(multiplier or 1))
+    except (TypeError, ValueError):
+        multiplier = 1
+    scheduled = float(target_fps) / multiplier
+    if scheduled <= capture_fps * 1.5:
+        return None
+    suggested = even_multiplier(float(target_fps) / capture_fps)
+    return (f"o jogo entrega ~{capture_fps:.0f} quadros/s e a captura está agendada para "
+            f"{scheduled:.0f}/s (FPS de saída ÷ multiplicador): as capturas extras repetem o "
+            f"mesmo quadro. Para casar a captura com o jogo use x{suggested} (ou o modo "
+            f"Ilimitado, que captura sempre na taxa real)")
+
+
 def internal_resolution_reason(choice, algorithm):
     """Why that resolution was picked, for the log."""
     if choice in INTERNAL_RESOLUTION_TARGETS or choice == "Native":
@@ -546,6 +618,8 @@ class FrameGenerationApp:
         # presents every frame as soon as it is ready.
         self.unlimited_fps = False
         self.last_presented_frame = None
+        self.capture_fps = 0.0        # real capture rate, published by the capture worker
+        self.display_work_ms = 0.0    # cost of one displayed frame in the display loop
         self.capture = None
         self.engine = RIFEEngine()
         self.running = False
@@ -617,6 +691,8 @@ class FrameGenerationApp:
         interval = capture_interval(self.target_fps, multiplier, unlimited)
 
         last_capture_time = time.perf_counter()
+        captures = 0
+        capture_window = last_capture_time
 
         try:
             while self.running:
@@ -661,6 +737,15 @@ class FrameGenerationApp:
 
                     if not is_duplicate:
                         last_frame = frame
+                        captures += 1
+                        # Publish how fast the source really delivers: it is the ceiling
+                        # the multiplier is applied to, and the number that explains a
+                        # displayed rate that "does not go past" it.
+                        window_now = time.perf_counter()
+                        if window_now - capture_window >= 5.0:
+                            self.capture_fps = captures / (window_now - capture_window)
+                            captures = 0
+                            capture_window = window_now
                         # Prepare a display-ready copy for the fallback path: while the
                         # generator is behind, LIVE frames must look like generated ones.
                         now_publish = time.perf_counter()
@@ -827,13 +912,19 @@ class FrameGenerationApp:
         try:
             source = "live" if self.live_fallback else "generated"
             queue_size = self.display_queue.qsize()
+            capture_fps = getattr(self, "capture_fps", 0.0)
+            work_ms = getattr(self, "display_work_ms", 0.0)
             print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
-                  f"{self.generated_fps:5.1f} frames gerados/s  ·  fila {queue_size}  ·  "
-                  f"{source}  ·  captura {self.frame_multiplier}x")
+                  f"{self.generated_fps:5.1f} frames gerados/s  ·  captura {capture_fps:4.1f}/s  ·  "
+                  f"{work_ms:4.1f} ms por quadro  ·  fila {queue_size}  ·  "
+                  f"{source}  ·  geração x{self.frame_multiplier}")
             diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
                                                f"{self.generated_fps:5.1f} gerados/s · "
+                                               f"captura {capture_fps:.1f}/s · "
+                                               f"{work_ms:.1f} ms por quadro · "
                                                f"{self._queue_report(queue_size)} · "
                                                f"{source} · {self.dropped_generated} descartados")
+            self._log_rate_diagnosis(loop_now)
         except Exception as exc:
             # Write directly: the report itself is what failed.
             try:
@@ -841,6 +932,28 @@ class FrameGenerationApp:
             except Exception:
                 pass
         return loop_now
+
+    # A ceiling is worth explaining, but not on every report.
+    DIAGNOSIS_INTERVAL_SECONDS = 15.0
+
+    def _log_rate_diagnosis(self, now):
+        """Write one line saying what is limiting the displayed rate, at most occasionally."""
+        if now - getattr(self, "_diagnosis_time", 0.0) < self.DIAGNOSIS_INTERVAL_SECONDS:
+            return
+        message = rate_diagnosis(
+            self.current_fps, self.generated_fps, getattr(self, "capture_fps", 0.0),
+            self.target_fps, self.frame_multiplier,
+            unlimited=bool(getattr(self, "unlimited_fps", False)),
+            work_ms=getattr(self, "display_work_ms", 0.0))
+        if not message:
+            message = capture_sync_hint(
+                getattr(self, "capture_fps", 0.0), self.target_fps, self.frame_multiplier,
+                unlimited=bool(getattr(self, "unlimited_fps", False)))
+        if not message:
+            return
+        self._diagnosis_time = now
+        print(f"[overlay] {message}")
+        diagnostics.write_now("desempenho", message)
 
     def _queue_report(self, display_size=None):
         """One line about queue occupancy, for the periodic diagnostics log."""
@@ -1501,7 +1614,10 @@ class FrameGenerationApp:
                             self.show_fps = False
 
                     self._present_overlay(screen)
-                    
+                    spent_ms = (time.perf_counter() - now) * 1000.0
+                    self.display_work_ms = (spent_ms if self.display_work_ms <= 0
+                                            else self.display_work_ms * 0.8 + spent_ms * 0.2)
+
                     self.frame_count += 1
                     fps_window_frames += 1
                     if self.last_frame_generated:

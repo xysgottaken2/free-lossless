@@ -338,6 +338,35 @@ Cada sessão do overlay grava um resumo em `overlay.log`, na mesma pasta do arqu
 preferências (`%LOCALAPPDATA%\FreeLossless` no Windows). O log registra resolução
 interna, FPS exibidos, frames gerados por segundo, fila e cada troca de fonte.
 
+## "O FPS não passa de X": como ler os números
+
+São três taxas diferentes, e cada uma tem uma causa e um conserto:
+
+| Número | Onde ver | O que significa |
+| --- | --- | --- |
+| **captura N/s** | log (`[overlay]` e `[frame gen]`), a cada 5 s | quadros **novos** que o jogo realmente produziu |
+| **gerados/s** | painel do overlay (chip `FG N/s`) e log | quadros interpolados que a máquina conseguiu entregar |
+| **FPS exibidos** | número grande do painel e log | quadros apresentados na tela por segundo |
+
+E as três se relacionam assim:
+
+- **Com FPS fixo**, a captura é agendada em `FPS de saída ÷ multiplicador` (x2 a 120 FPS
+  → 60 capturas/s). Se o **jogo roda abaixo disso**, as capturas extras veem o mesmo
+  quadro de novo — não há nada novo para interpolar, e o movimento fica na taxa do jogo
+  por mais alto que esteja o FPS de saída. **O conserto é aumentar o multiplicador** (para
+  casar a captura com o jogo) **ou usar o modo Ilimitado**, que captura sempre na taxa
+  real. O log agora diz isso em uma linha:
+  `o jogo entrega ~20 quadros/s e a captura está agendada para 60/s … use x6 (ou o modo Ilimitado)`.
+- **Com Ilimitado**, a captura segue o jogo e o multiplicador vira ganho: 20 FPS de jogo
+  com x6 = 120 na tela.
+- Se o teto for a **máquina**, o log também diz qual dos dois: `o overlay leva N ms por
+  quadro…` (o próprio overlay é o gargalo) ou `o gerador entrega N quadros/s…` (a
+  interpolação é o gargalo — abaixe a resolução interna ou use um multiplicador menor).
+
+Exemplo real: um jogo a **20 FPS** com saída de 120 FPS. Com x2 o movimento fica em ~40;
+com **x6** a captura cai exatamente na taxa do jogo e cada par rende 5 intermediários —
+120 na tela, muito mais liso. É o mesmo princípio do Lossless Scaling.
+
 ## Se o app não abrir ("o arquivo de paginação é muito pequeno")
 
 O Windows pode recusar carregar uma DLL grande quando o **limite de memória

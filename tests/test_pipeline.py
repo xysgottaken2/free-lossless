@@ -383,3 +383,72 @@ class RepeatPresentationTests(unittest.TestCase):
         image = object()
         app.last_presented_frame = image
         self.assertFalse(app._repeat_of_presented(image))
+
+class RateDiagnosisTests(unittest.TestCase):
+    """The log must say *why* the displayed rate stopped following the configured one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def test_a_healthy_session_says_nothing(self):
+        self.assertIsNone(self.module.rate_diagnosis(118.0, 118.0, 60.0, 120, 2))
+        self.assertIsNone(self.module.rate_diagnosis(116.0, 96.0, 20.0, 120, 6, unlimited=True))
+
+    def test_an_overlay_that_is_its_own_ceiling_is_named(self):
+        message = self.module.rate_diagnosis(20.0, 20.0, 60.0, 120, 2, work_ms=48.0)
+        self.assertIn("trabalho por quadro", message)
+        self.assertIn("48.0 ms", message)
+
+    def test_a_generator_that_cannot_add_the_frames_is_named(self):
+        message = self.module.rate_diagnosis(40.0, 5.0, 60.0, 120, 2, work_ms=2.0)
+        self.assertIn("interpolação", message)
+        self.assertIn("5 quadros/s", message)
+
+    def test_in_unlimited_the_game_rate_is_named_as_the_ceiling(self):
+        # The generator is doing its share, but the source itself delivers little.
+        message = self.module.rate_diagnosis(20.0, 18.0, 20.0, 120, 2, unlimited=True, work_ms=2.0)
+        self.assertIn("taxa do jogo", message)
+
+    def test_nothing_is_reported_without_a_rate(self):
+        self.assertIsNone(self.module.rate_diagnosis(20.0, 20.0, 0.0, 120, 2, unlimited=True))
+
+
+class CaptureSyncHintTests(unittest.TestCase):
+    """Capturing faster than the game only repeats frames: the log suggests the fix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def test_a_game_slower_than_the_capture_gets_a_suggestion(self):
+        message = self.module.capture_sync_hint(20.0, 120, 2)
+        self.assertIn("agendada para 60/s", message)
+        self.assertIn("x6", message)                 # 120 / 20 = 6, an allowed multiplier
+        self.assertIn("Ilimitado", message)
+
+    def test_the_suggestion_is_always_an_allowed_multiplier(self):
+        for capture, target, current, expected in ((20.0, 120, 2, 6), (14.0, 120, 2, 8),
+                                                   (33.0, 120, 2, 4), (5.0, 120, 2, 20)):
+            with self.subTest(capture=capture, target=target, current=current):
+                message = self.module.capture_sync_hint(capture, target, current)
+                self.assertIn(f"x{expected} ", message + " ")
+
+    def test_a_capture_already_in_step_says_nothing(self):
+        self.assertIsNone(self.module.capture_sync_hint(60.0, 120, 2))
+        self.assertIsNone(self.module.capture_sync_hint(40.0, 120, 2))   # 60/s: borderline, fine
+
+    def test_unlimited_needs_no_hint_and_neither_do_missing_numbers(self):
+        self.assertIsNone(self.module.capture_sync_hint(20.0, 120, 2, unlimited=True))
+        self.assertIsNone(self.module.capture_sync_hint(0.0, 120, 2))
+        self.assertIsNone(self.module.capture_sync_hint(20.0, 0, 2))
+
+    def test_the_multiplier_is_clamped_to_what_the_menu_offers(self):
+        self.assertEqual(self.module.even_multiplier(1.0), 2)
+        self.assertEqual(self.module.even_multiplier(3.4), 4)
+        self.assertEqual(self.module.even_multiplier(50.0), 20)
+        self.assertEqual(self.module.even_multiplier("x2"), 2)
