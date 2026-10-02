@@ -26,3 +26,24 @@ def load_module(name, dependencies, runtime=False):
 
 def stubs(*names):
     return {name: MagicMock(name=name) for name in names}
+
+
+def silence_diagnostics(test):
+    """Send the shared diagnostics log nowhere for one test, and restore it afterwards.
+
+    ``diagnostics`` is a real module shared by every test in the run, so a leftover
+    lambda here silently swallows the messages another test is asserting on — which is
+    how a green suite turns red for no visible reason.
+    """
+    import diagnostics as diagnostics_module
+    original = (diagnostics_module.write, diagnostics_module.write_now, diagnostics_module.ENABLED)
+
+    def restore():
+        (diagnostics_module.write, diagnostics_module.write_now,
+         diagnostics_module.ENABLED) = original
+
+    test.addCleanup(restore)
+    diagnostics_module.ENABLED = False
+    diagnostics_module.write = lambda message: None
+    diagnostics_module.write_now = lambda label, message: None
+    return restore

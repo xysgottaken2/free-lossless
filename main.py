@@ -178,9 +178,29 @@ def display_interval(target_fps, unlimited=False):
     return 1.0 / target_fps if target_fps > 0 else 0.0
 
 
-# Nothing new arrived: how long the capture and the presentation loops wait before
-# looking again. Small enough to catch the next real frame, long enough not to spin.
+# Nothing new arrived and there is no event to wait on: a fraction of a millisecond
+# is enough to catch the next frame without spinning.
 UNLIMITED_IDLE_SLEEP = 0.0005
+# How long the display loop waits on the frame event before checking the rest
+# (hotkeys, window styles, stall detection) again.
+FRAME_WAIT_SECONDS = 0.05
+# How often the capture thread reports its own rate to the log.
+CAPTURE_REPORT_SECONDS = 5.0
+
+
+def stall_timeout_seconds(unlimited, reference_interval, capture_fps=0.0):
+    """How long without a new frame counts as a stall.
+
+    With a fixed output rate the presentation clock is the reference. Unlimited has no
+    clock at all, so the reference has to be the measured capture rate: a machine
+    capturing at 20 FPS leaves 50 ms between frames, which is longer than the fixed
+    threshold — it would look permanently stalled, and the overlay would sit in LIVE
+    (where every stage waits for the capture) for the whole session.
+    """
+    if not unlimited:
+        return max(reference_interval * 2, 0.03)
+    observed = 1.0 / capture_fps if capture_fps and capture_fps > 1.0 else 0.0
+    return max(observed * 3.0, 0.12)
 
 
 # Generation may use at most this share of the capture interval; the rest is
@@ -458,7 +478,7 @@ HUD_GAP = 8
 HUD_CHIP_PADDING = 16
 
 
-def hud_chips(fsr_on, ai_on, ultra_smooth, live=False, generated_fps=None):
+def hud_chips(fsr_on, ai_on, ultra_smooth, live=False, generated_fps=None, capture_fps=None):
     """Status chips for the overlay panel, as (label, value, color key).
 
     ``live`` marks frames that came straight from the capture because the pipeline
@@ -469,12 +489,16 @@ def hud_chips(fsr_on, ai_on, ultra_smooth, live=False, generated_fps=None):
     source = i18n.translate("hud.live") if live else i18n.translate("hud.generated")
     if generated_fps is not None and (generated_fps >= 1 or not live):
         source = f"{source} {round(generated_fps)}/s"
-    return [
+    chips = [
         ("FSR", "ON" if fsr_on else "OFF", "on" if fsr_on else "off"),
         ("AI", "ON" if ai_on else "OFF", "on" if ai_on else "off"),
         (i18n.translate("hud.mode"), mode, "mode" if ultra_smooth else "off"),
         ("", source, "mode" if live else "on"),
     ]
+    if capture_fps is not None and capture_fps > 0:
+        # What the machine is really capturing: the number every other rate depends on.
+        chips.append((i18n.translate("hud.capture"), f"{round(capture_fps)}/s", "off"))
+    return chips
 
 
 def processing_subroutine(capture_queue, process_queue, engine_config, stop_event):
@@ -618,7 +642,6 @@ class FrameGenerationApp:
         # presents every frame as soon as it is ready.
         self.unlimited_fps = False
         self.last_presented_frame = None
-        self.capture_fps = 0.0        # real capture rate, published by the capture worker
         self.display_work_ms = 0.0    # cost of one displayed frame in the display loop
         self.capture = None
         self.engine = RIFEEngine()
@@ -646,12 +669,24 @@ class FrameGenerationApp:
         self.generated_fps = 0.0
         self.dropped_generated = 0
         self.last_frame_generated = False
-        # Cost of rendering live frames, and the budget it must fit (half a frame).
+        # Cost of rendering live frames, and the budget it must fit (one frame).
         self.live_render_ms = 0.0
-        self.live_render_budget_ms = 0.0
+        self.live_render_budget_ms = 1000.0 / max(1, target_fps)
         self.live_cost_logged = False
+        # Rendered live frames are remembered per captured frame, so holding an image
+        # never renders it twice.
+        self._last_live_source = None
+        self._last_live_display = None
         # Last image shown, reused for a brief hiccup instead of swapping to the capture.
         self.last_shown_frame = None
+        # Measured capture rates (all captures, and the ones that were new frames), for
+        # the stall threshold, the Auto decision and the HUD. Negative means "not
+        # measured yet": a screen that is not changing really does measure zero.
+        self.capture_poll_fps = -1.0
+        self.capture_fps = -1.0
+        # Set by the producers when a frame is ready, so the display loop can sleep
+        # instead of polling: burning a core here is burning the capture's CPU.
+        self.frame_ready = threading.Event()
         
         # Window & Performance management
         self.last_rect = None
@@ -685,6 +720,9 @@ class FrameGenerationApp:
     def capture_worker(self):
         print("Capture worker started")
         last_frame = None
+        captures = 0
+        fresh = 0
+        capture_report_time = time.perf_counter()
         unlimited = bool(getattr(self, "unlimited_fps", False))
         multiplier = effective_capture_multiplier(getattr(self, "fg_enabled", True),
                                                    getattr(self, "frame_multiplier", 2), unlimited)
@@ -692,7 +730,6 @@ class FrameGenerationApp:
 
         last_capture_time = time.perf_counter()
         captures = 0
-        capture_window = last_capture_time
 
         try:
             while self.running:
@@ -737,27 +774,41 @@ class FrameGenerationApp:
 
                     if not is_duplicate:
                         last_frame = frame
-                        captures += 1
-                        # Publish how fast the source really delivers: it is the ceiling
-                        # the multiplier is applied to, and the number that explains a
-                        # displayed rate that "does not go past" it.
-                        window_now = time.perf_counter()
-                        if window_now - capture_window >= 5.0:
-                            self.capture_fps = captures / (window_now - capture_window)
-                            captures = 0
-                            capture_window = window_now
-                        # Prepare a display-ready copy for the fallback path: while the
-                        # generator is behind, LIVE frames must look like generated ones.
-                        now_publish = time.perf_counter()
-                        if self.want_live_frames or now_publish - self.live_publish_time >= 0.2:
-                            self.live_publish_time = now_publish
-                            self._publish_live_frame(frame)
+                        fresh += 1
+                        # Hand the prepared frame to the display loop as well: it is the
+                        # newest thing on screen and the LIVE path shows it at need.
+                        # Rendering it is the display loop's job — this thread has to
+                        # stay fast, it feeds every other stage. Publishing everything
+                        # also means the LIVE image is never stale.
+                        self._publish_live_frame(frame)
                         put_latest(self.capture_queue, frame)
                     elif unlimited:
                         # Nothing new on screen: back off a fraction of a millisecond
                         # instead of re-capturing in a tight loop. A game running at
                         # 60 Hz is still picked up with the next refresh.
                         time.sleep(UNLIMITED_IDLE_SLEEP)
+
+                # Two rates, published every few seconds instead of per frame: how many
+                # times the screen could be grabbed (the machine's own limit, which the
+                # stall threshold uses) and how many of those were *new* frames (the
+                # game's rate, which the multiplier is applied to, Auto uses, and the
+                # panel shows). Duplicates are the difference between the two.
+                captures += 1
+                capture_now = time.perf_counter()
+                elapsed = capture_now - capture_report_time
+                if elapsed >= CAPTURE_REPORT_SECONDS:
+                    self.capture_poll_fps = captures / elapsed
+                    self.capture_fps = fresh / elapsed
+                    size = self.capture.region
+                    message = (f"{self.capture_fps:5.1f} quadros novos/s · "
+                               f"{self.capture_poll_fps:5.1f} capturas/s · "
+                               f"{elapsed * 1000.0 / max(1, captures):5.1f} ms por captura · "
+                               f"{size[2] - size[0]}x{size[3] - size[1]} · "
+                               f"{captures - fresh} iguais")
+                    print(f"[captura] {message}")
+                    diagnostics.write_now("captura", message)
+                    captures = fresh = 0
+                    capture_report_time = capture_now
         finally:
             # Release DXGI/GDI resources on the same worker that used them.
             self.capture.stop_capture()
@@ -790,39 +841,59 @@ class FrameGenerationApp:
         return cv2.resize(frame, self.display_dim, interpolation=interpolation)
 
     def _publish_live_frame(self, frame):
-        """Render a captured frame exactly like a generated one.
+        """Hand the newest captured frame to the display loop.
 
-        Same filters, same upscale: a live frame has to be indistinguishable from a
-        generated one, otherwise falling back to the capture shows up as flicker. An
-        earlier version switched to a cheap render when the cost went over budget —
-        and since the cost hovers around the budget, consecutive frames alternated
-        between sharp and soft, which is exactly what the eye picks up as flicker.
-        The cost is measured and written to the log instead.
+        No rendering happens here on purpose. This runs in the capture thread, and a
+        capture thread that also filters and upscales captures less — measured: 1080p
+        with the neural upscaler pinned the whole overlay at ~20 frames per second,
+        because every stage downstream only gets frames as fast as this thread makes
+        them, and LIVE renders *every* captured frame. Rendering now happens in the
+        display loop (``_live_frame_for_display``), which is the stage that has the
+        frame budget, and the capture rate stays whatever the machine can do.
         """
+        put_latest(self.live_display_queue, frame)
+        if self.want_live_frames:
+            # Only worth waking the display loop when it is actually showing captures.
+            self.frame_ready.set()
+
+    def _newest_live_frame(self):
+        """Newest captured frame; repeats the previous one instead of showing nothing."""
+        while True:
+            try:
+                self.last_live_display = self.live_display_queue.get_nowait()
+            except Empty:
+                return self.last_live_display
+
+    def _live_frame_for_display(self):
+        """Newest capture, rendered exactly like a generated frame.
+
+        The render is paid by the display loop and remembered per captured frame, so
+        holding an image never renders it twice. Same filters, same upscale as the
+        generated path: a live frame has to be indistinguishable from a generated one,
+        otherwise falling back to the capture shows up as flicker.
+        """
+        frame = self._newest_live_frame()
+        if frame is None:
+            return None
+        if frame is self._last_live_source:
+            return self._last_live_display
         started = time.perf_counter()
         try:
             display = self._render_for_display(frame)
         except Exception as exc:
             diagnostics.write_now("exibição", f"falha ao preparar frame ao vivo: {exc}")
-            return
+            return frame
         spent = (time.perf_counter() - started) * 1000.0
         self.live_render_ms = (spent if self.live_render_ms <= 0
                                else self.live_render_ms * 0.8 + spent * 0.2)
         if not self.live_cost_logged and self.live_render_ms > self.live_render_budget_ms:
             self.live_cost_logged = True
             diagnostics.write_now("exibição", f"frames ao vivo custam {self.live_render_ms:.1f} ms "
-                                              f"(meio intervalo de quadro é "
-                                              f"{self.live_render_budget_ms:.1f} ms): o modo LIVE "
-                                              f"entrega uma imagem por captura")
-        put_latest(self.live_display_queue, display)
-
-    def _newest_live_frame(self):
-        """Newest prepared capture; repeats the previous one instead of showing nothing."""
-        while True:
-            try:
-                self.last_live_display = self.live_display_queue.get_nowait()
-            except Empty:
-                return self.last_live_display
+                                              f"por quadro (intervalo de quadro "
+                                              f"{self.live_render_budget_ms:.1f} ms): em LIVE o "
+                                              f"overlay entrega uma imagem por captura")
+        self._last_live_source, self._last_live_display = frame, display
+        return display
 
     def _take_generated_frame(self, min_buffer):
         """Newest generated frame, dropping any backlog: late frames are stale."""
@@ -875,12 +946,12 @@ class FrameGenerationApp:
         if self.live_fallback:
             # Stay on the capture for the whole episode: alternating between the two
             # sources frame by frame is the flicker being removed here.
-            frame = self._newest_live_frame()
+            frame = self._live_frame_for_display()
         elif generated is not None:
             frame, from_generator = generated, True
         elif self.frame_count == 0 or self.last_shown_frame is None:
             # First frames: there is nothing to hold on to, use the capture.
-            frame = self._newest_live_frame()
+            frame = self._live_frame_for_display()
         else:
             # A brief hiccup: repeat the last image instead of changing its look.
             frame = self.last_shown_frame
@@ -888,6 +959,20 @@ class FrameGenerationApp:
             self.last_shown_frame = frame
         self.last_frame_generated = from_generator
         return frame
+
+    def _wait_for_frame(self, timeout=FRAME_WAIT_SECONDS):
+        """Sleep until a producer says a frame is ready, or the timeout passes.
+
+        Unlimited has no presentation clock to pace the loop, and spinning for a frame
+        burns the CPU the capture and the post-processing threads need — which is what
+        lowered the frame rate it was trying to measure.
+        """
+        event = getattr(self, "frame_ready", None)
+        if event is None:
+            time.sleep(UNLIMITED_IDLE_SLEEP)
+            return
+        event.wait(timeout)
+        event.clear()
 
     def _repeat_of_presented(self, frame):
         """True when the same image would go to the screen a second time.
@@ -912,15 +997,19 @@ class FrameGenerationApp:
         try:
             source = "live" if self.live_fallback else "generated"
             queue_size = self.display_queue.qsize()
+            # The three rates, plus the cost of one displayed frame: without all of
+            # them a ceiling like "20 FPS" cannot be attributed to the game, to the
+            # generator or to the overlay itself.
             capture_fps = getattr(self, "capture_fps", 0.0)
             work_ms = getattr(self, "display_work_ms", 0.0)
+            captured = f"{capture_fps:4.1f}/s" if capture_fps > 0 else "  ?  "
             print(f"[overlay] {self.current_fps:5.1f} FPS exibidos  ·  "
-                  f"{self.generated_fps:5.1f} frames gerados/s  ·  captura {capture_fps:4.1f}/s  ·  "
+                  f"{self.generated_fps:5.1f} frames gerados/s  ·  captura {captured}  ·  "
                   f"{work_ms:4.1f} ms por quadro  ·  fila {queue_size}  ·  "
                   f"{source}  ·  geração x{self.frame_multiplier}")
             diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
                                                f"{self.generated_fps:5.1f} gerados/s · "
-                                               f"captura {capture_fps:.1f}/s · "
+                                               f"captura {captured} · "
                                                f"{work_ms:.1f} ms por quadro · "
                                                f"{self._queue_report(queue_size)} · "
                                                f"{source} · {self.dropped_generated} descartados")
@@ -1004,23 +1093,42 @@ class FrameGenerationApp:
         elapsed = now - getattr(self, "_auto_probe_start", now)
         if elapsed < AUTO_PROBE_SECONDS:
             return False
-        # In unlimited mode there is no configured rate to hit: the reference is what
-        # the overlay is actually showing. If the generator delivers less than its
-        # share of that, it is the bottleneck — and lowering the processing resolution
-        # is exactly what raises the number of frames the machine can produce.
-        reference = self.current_fps if getattr(self, "unlimited_fps", False) else self.target_fps
-        required = reference * (self.frame_multiplier - 1) / self.frame_multiplier
+        # The honest reference is the rate of *new* captured frames: the generator's
+        # whole job is multiplying them. If the overlay shows much less than
+        # captures x multiplier, the generator is the bottleneck — and lowering the
+        # processing resolution is what raises the number of frames it can produce.
+        #
+        # Counting the frames that reach the screen (this used to be the check) is not
+        # enough: the real frames forwarded by the worker count as generated too, so a
+        # generator producing nothing at all looked healthy at x2.
+        capture_fps = self._auto_capture_rate()
+        required = capture_fps * self.frame_multiplier * AUTO_PROBE_MIN_RATIO
         achieved = getattr(self, "_auto_probe_generated", 0) / elapsed
-        if achieved >= required * AUTO_PROBE_MIN_RATIO:
+        if achieved >= required:
             self._auto_probe_start = now     # healthy: watch the next window
             self._auto_probe_generated = 0
             return False
         self._set_internal_resolution(self.capture.region, auto_step=step + 1)
         diagnostics.write_now(
             "imagem",
-            f"geração {achieved:.0f}/{required:.0f} quadros/s: resolução interna reduzida "
-            f"para {self.internal_res[0]}x{self.internal_res[1]} (Auto, degrau {step + 1})")
+            f"tela a {achieved:.0f} de {required:.0f} quadros/s (captura "
+            f"{capture_fps:.0f}/s x{self.frame_multiplier}): resolução interna reduzida para "
+            f"{self.internal_res[0]}x{self.internal_res[1]} (Auto, degrau {step + 1})")
         return True
+
+    def _auto_capture_rate(self):
+        """Frames per second the capture is really turning into new frames.
+
+        Measured by the capture thread. Until the first measurement lands, the fallback
+        keeps the decision sane: the capture is scheduled at FPS / multiplier with a
+        fixed rate, and in unlimited the displayed rate is the best guess available.
+        """
+        measured = getattr(self, "capture_fresh_fps", -1.0)
+        if measured >= 0.0:
+            return measured
+        if getattr(self, "unlimited_fps", False):
+            return self.current_fps
+        return self.target_fps / max(1, self.frame_multiplier)
 
     def _measure_filter_chain(self):
         """Log what the chosen filter preset costs per frame.
@@ -1207,6 +1315,7 @@ class FrameGenerationApp:
                 continue
             try:
                 put_latest(self.display_queue, self._render_for_display(frame))
+                self.frame_ready.set()
             except Exception as exc:
                 print(f"Post-processing error: {exc}")
                 diagnostics.write_now("exibição", f"erro no pós-processamento: {exc}")
@@ -1327,7 +1436,9 @@ class FrameGenerationApp:
         chips = []
         for label, value, state in hud_chips(self.fsr_mode, self.ai_mode, self.ultra_smooth,
                                              live=self.live_fallback,
-                                             generated_fps=self.generated_fps if show_rate else None):
+                                             generated_fps=self.generated_fps if show_rate else None,
+                                             capture_fps=(getattr(self, "capture_fps", -1.0)
+                                                          if show_rate else None)):
             chips.append((HUD_COLORS[state], small_font.render(f"{label} {value}".strip(), True,
                                                               HUD_COLORS[state])))
         return chips
@@ -1335,7 +1446,9 @@ class FrameGenerationApp:
     def _hud_parts(self, font, small_font, max_width=None):
         """Render the panel once per status change, not once per displayed frame."""
         key = (round(self.current_fps), self.fsr_mode, self.ai_mode, self.ultra_smooth,
-               self.live_fallback, round(self.generated_fps), i18n.get_language(), max_width)
+               self.live_fallback, round(self.generated_fps),
+               round(max(0.0, getattr(self, "capture_fps", -1.0))),
+               i18n.get_language(), max_width)
         cached = getattr(self, "_hud_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1466,9 +1579,13 @@ class FrameGenerationApp:
         # The reference interval still comes from the configured rate: in unlimited
         # mode it is what tells the overlay how long a "short" hiccup lasts.
         reference_interval = display_interval(self.target_fps)
-        # Live frames are rendered in the capture thread: half a frame interval is what
-        # it may spend without holding the captures back.
-        self.live_render_budget_ms = max(1.0, reference_interval * 1000.0 * 0.5)
+        # Live frames are rendered by the display loop, so the budget is a whole frame
+        # interval: above that, LIVE can no longer show one image per capture.
+        self.live_render_budget_ms = max(1.0, reference_interval * 1000.0)
+        self.live_cost_logged = False
+        self._last_live_source = None
+        self._last_live_display = None
+        self.frame_ready.clear()
         # The generator needs to miss a whole frame before LIVE frames take over, and
         # it has to prove it recovered before generated frames come back. Without the
         # second delay the two sources alternate every frame, which the eye reads as
@@ -1535,13 +1652,15 @@ class FrameGenerationApp:
                     last_style_check = now
                     self._apply_overlay_window_style(self.last_rect or rect, self.display_dim)
                 min_buffer = 1 if self.low_latency else 3
-                frame = self._pick_frame(now, min_buffer, stall_timeout, return_delay)
+                live_timeout = stall_timeout_seconds(unlimited, reference_interval, self.capture_fps)
+                frame = self._pick_frame(now, min_buffer, live_timeout, return_delay)
 
                 if frame is not None:
                     if self._repeat_of_presented(frame):
                         # Nothing new arrived: presenting the same picture again would
-                        # only burn CPU and inflate the frame counter.
-                        time.sleep(UNLIMITED_IDLE_SLEEP)
+                        # only burn CPU and inflate the frame counter. Sleep until a
+                        # producer has something, instead of polling for it.
+                        self._wait_for_frame()
                         continue
                     self.last_presented_frame = frame
                     last_display_time = now
@@ -1624,7 +1743,7 @@ class FrameGenerationApp:
                         generated_window += 1
                         self._auto_probe_generated += 1
                 else:
-                    time.sleep(0.0005)
+                    self._wait_for_frame(timeout=0.005)
 
             # Removed clock.tick to rely on perf_counter pacing
         finally:

@@ -67,6 +67,7 @@ class OverlayHudTests(unittest.TestCase):
         app.ultra_smooth = state.get("ultra_smooth", False)
         app.live_fallback = state.get("live_fallback", False)
         app.generated_fps = state.get("generated_fps", 60.4)
+        app.capture_fps = state.get("capture_fps", 41.2)
         app.hotkey_names = dict(self.module.DEFAULT_HOTKEY_NAMES)
         return app
 
@@ -101,7 +102,8 @@ class OverlayHudTests(unittest.TestCase):
 
     def test_panel_and_every_label_stay_inside_the_overlay(self):
         screen = self.draw_hud(self.make_app())
-        self.assertEqual(len(screen.blits), 12)  # panel, fps value+label, 4 chips + 4 texts, hint
+        # panel, fps value+label, 5 chips + 5 texts (the capture rate has its own), hint
+        self.assertEqual(len(screen.blits), 14)
         for size, (x, y) in screen.blits:
             self.assertGreaterEqual(x, 0)
             self.assertGreaterEqual(y, 0)
@@ -114,9 +116,9 @@ class OverlayHudTests(unittest.TestCase):
         self.assertEqual(panel_position, (16, 16))
         self.assertEqual(panel_size, self.draw.rects[0]["rect"][2:])
         self.assertEqual(self.draw.rects[0]["border_radius"], 12)
-        self.assertEqual(len(self.draw.rects), 5)  # panel outline plus one per chip
+        self.assertEqual(len(self.draw.rects), 6)  # panel outline plus one per chip
         self.assertTrue(all(entry["border_radius"] for entry in self.draw.rects))
-        self.assertEqual([entry["width"] for entry in self.draw.rects], [1, 1, 1, 1, 1])
+        self.assertEqual([entry["width"] for entry in self.draw.rects], [1] * 6)
 
     def test_panel_grows_with_the_content_and_fits_a_small_window(self):
         small = self.draw_hud(self.make_app(ultra_smooth=False), size=(320, 200))
@@ -126,6 +128,7 @@ class OverlayHudTests(unittest.TestCase):
         self.assertEqual(small.blits[0][1], (16, 16))
         # Chips are laid out left to right without overlapping or leaving the panel.
         chip_rects = [entry["rect"] for entry in self.draw.rects[1:]]
+        # A small window drops the rate chips (generation and capture) before overflowing.
         self.assertEqual(len(chip_rects), 4)
         for previous, following in zip(chip_rects, chip_rects[1:]):
             self.assertLessEqual(previous[0] + previous[2], following[0])
@@ -148,6 +151,14 @@ class OverlayHudTests(unittest.TestCase):
         app.fsr_mode = True
         app._draw_hud(screen, font, small_font)
         self.assertIn("FSR ON", small_font.rendered)
+
+    def test_the_capture_rate_has_its_own_chip(self):
+        chips = self.module.hud_chips(False, False, False, capture_fps=41.2)
+        self.assertEqual(chips[-1], ("CAP", "41/s", "off"))
+        # Not measured yet (or a small panel): no chip to show.
+        self.assertEqual(self.module.hud_chips(False, False, False, capture_fps=-1.0)[-1],
+                         ("", "FG", "on"))
+        self.assertEqual(len(self.module.hud_chips(False, False, False, capture_fps=0.0)), 4)
 
     def test_hint_uses_the_configured_stop_key(self):
         app = self.make_app()

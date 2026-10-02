@@ -270,6 +270,8 @@ class AutoAdaptationTests(unittest.TestCase):
         app.frame_multiplier = multiplier
         app.target_fps = target_fps
         app.capture = MagicMock(region=(0, 0, 1920, 1080))
+        app.capture_fps = -1.0
+        app.capture_fresh_fps = -1.0
         app.internal_res = (1920, 1080)
         app._auto_step = 0
         app._auto_probe_start = 0.0
@@ -285,11 +287,27 @@ class AutoAdaptationTests(unittest.TestCase):
 
     def test_a_healthy_generator_keeps_the_sharp_resolution(self):
         app = self.app()
-        app._auto_probe_generated = 600                # 60 frames/s: exactly what 2x asks
+        app.capture_fresh_fps = 60.0                   # the machine captures 60 new frames/s
+        app._auto_probe_generated = 1200               # x2 asks for 120 on screen: delivered
         self.assertFalse(app._auto_adapt(10.0))
         self.assertEqual(app.internal_res, (1920, 1080))
         self.assertEqual(app._auto_step, 0)
         self.assertEqual(app._auto_probe_generated, 0)  # window restarted
+
+    def test_a_generator_that_adds_nothing_is_caught(self):
+        """Showing only the real frames at x2 is exactly the bug this protects against."""
+        app = self.app()
+        app.capture_fresh_fps = 60.0
+        app._auto_probe_generated = 600                # 60/s on screen: the capture rate
+        self.assertTrue(app._auto_adapt(10.0))
+        self.assertEqual(app._auto_step, 1)
+
+    def test_a_static_screen_never_triggers_the_adaptation(self):
+        app = self.app()
+        app.capture_fresh_fps = 0.0                    # nothing new to interpolate
+        app._auto_probe_generated = 0
+        self.assertFalse(app._auto_adapt(10.0))
+        self.assertEqual(app.internal_res, (1920, 1080))
 
     def test_the_first_window_is_only_a_measurement(self):
         app = self.app()
@@ -303,13 +321,32 @@ class AutoAdaptationTests(unittest.TestCase):
         self.assertFalse(app._auto_adapt(10.0))
         self.assertEqual(app.internal_res, (1920, 1080))
 
-    def test_in_unlimited_the_reference_is_what_is_on_screen(self):
-        """No configured rate to hit: the target is the rate being displayed."""
+    def test_in_unlimited_the_reference_is_the_measured_capture_rate(self):
+        """No configured rate to hit: the capture rate is what the generator multiplies."""
         app = self.app(target_fps=120)
         app.unlimited_fps = True
-        app.current_fps = 40.0
-        app._auto_probe_generated = 20          # 2 frames/s against a 20/s target
+        app.capture_fresh_fps = 30.0
+        app._auto_probe_generated = 300         # 30/s on screen at x2: nothing was added
         self.assertTrue(app._auto_adapt(10.0))
+        self.assertEqual(app._auto_step, 1)
+
+    def test_in_unlimited_a_multiplied_capture_rate_is_healthy(self):
+        app = self.app(target_fps=120)
+        app.unlimited_fps = True
+        app.capture_fresh_fps = 30.0
+        app._auto_probe_generated = 600         # 60/s on screen: x2 delivered
+        self.assertFalse(app._auto_adapt(10.0))
+        self.assertEqual(app._auto_step, 0)
+
+    def test_the_fallback_reference_before_the_capture_is_measured(self):
+        app = self.app(target_fps=120)
+        self.assertEqual(app._auto_capture_rate(), 60.0)     # scheduled at FPS / multiplier
+        app.unlimited_fps = True
+        app.current_fps = 42.0
+        app.capture_fresh_fps = -1.0
+        self.assertEqual(app._auto_capture_rate(), 42.0)     # best guess until the first window
+        app.capture_fresh_fps = 24.0
+        self.assertEqual(app._auto_capture_rate(), 24.0)     # measured wins
 
     def test_a_single_capture_pass_does_not_need_the_generator(self):
         for multiplier, fg in ((1, True), (2, False)):

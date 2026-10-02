@@ -4,6 +4,7 @@ Two problems used to show up on screen at the same time: the displayed image
 stopped whenever the frame generator could not keep up, and the status chip
 alternated between FG and LIVE on every frame, which reads as flicker.
 """
+import threading
 import time
 import unittest
 from queue import Queue
@@ -13,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - numpy ships in requirements.txt
     np = None
 
-from helpers import load_module, stubs
+from helpers import load_module, silence_diagnostics, stubs
 
 
 class DisplayFallbackTests(unittest.TestCase):
@@ -37,7 +38,16 @@ class DisplayFallbackTests(unittest.TestCase):
         self.app.dropped_generated = 0
         self.app.frame_count = 1          # the first frame was already shown
         self.app.last_shown_frame = None
-        self.module.diagnostics.write = lambda message: None
+        # Live frames are rendered by the display loop now (the capture thread only
+        # hands over the prepared frame), so the loop needs the render path.
+        self.app._last_live_source = None
+        self.app._last_live_display = None
+        self.app.live_render_ms = 0.0
+        self.app.live_render_budget_ms = 4.0
+        self.app.live_cost_logged = False
+        self.app._render_for_display = lambda frame: frame
+        silence_diagnostics(self)
+        self.app.frame_ready = threading.Event()
         self.module.print = lambda *args, **kwargs: None
 
     def live(self, value):
@@ -83,6 +93,98 @@ class ImageKeepsMovingTests(DisplayFallbackTests):
             self.generated(f"generated-{index}")
         self.pick(0.0, min_buffer=3)
         self.assertEqual(self.app.display_queue.qsize(), 2)          # never grows further
+
+
+class StallRuleTests(unittest.TestCase):
+    """When a missing frame counts as a stall — the rule that kept unlimited at 20 FPS."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def rule(self, unlimited, interval, capture_fps=0.0):
+        return self.module.stall_timeout_seconds(unlimited, interval, capture_fps)
+
+    def test_a_fixed_rate_keeps_the_presentation_reference(self):
+        self.assertAlmostEqual(self.rule(False, 1 / 30), 2 / 30)  # two frame intervals
+        self.assertEqual(self.rule(False, 1 / 120), 0.03)         # never below the floor
+
+    def test_unlimited_uses_the_measured_capture_rate(self):
+        self.assertAlmostEqual(self.rule(True, 1 / 120, 20.0), 0.15)
+        self.assertAlmostEqual(self.rule(True, 1 / 120, 240.0), 0.12)   # floor
+
+    def test_unlimited_before_the_first_measurement_uses_the_floor(self):
+        self.assertEqual(self.rule(True, 1 / 120, -1.0), 0.12)
+
+    def test_a_slow_capture_is_not_a_stall_but_a_frozen_pipeline_still_is(self):
+        timeout = self.rule(True, 1 / 120, 20.0)
+        self.assertLess(1 / 20, timeout)      # 50 ms between frames is normal at 20 FPS
+        self.assertGreater(0.4, timeout)      # four hundred milliseconds is not
+
+
+class UnlimitedStallTests(DisplayFallbackTests):
+    """The actual complaint: a 20 FPS capture pinned the overlay at 20 FPS in unlimited."""
+
+    def test_a_slow_but_steady_capture_is_not_a_stall(self):
+        timeout = self.module.stall_timeout_seconds(True, 1 / 120, 20.0)
+        now = 0.0
+        for step in range(40):                       # eight seconds at 20 FPS
+            frame = f"generated-{step}"              # same object for publish and check
+            self.generated(frame)
+            self.assertIs(self.pick(now, stall=timeout, delay=0.3), frame)
+            self.assertFalse(self.app.live_fallback, f"LIVE entrou no passo {step}")
+            now += 1 / 20
+
+    def test_a_frozen_pipeline_still_falls_back(self):
+        timeout = self.module.stall_timeout_seconds(True, 1 / 120, 20.0)
+        self.live("live")
+        self.generated("generated")
+        self.pick(0.0, stall=timeout, delay=0.3)
+        self.pick(0.4, stall=timeout, delay=0.3)     # nothing new: starving starts
+        self.assertFalse(self.app.live_fallback)
+        self.assertIs(self.pick(0.4 + timeout + 0.01, stall=timeout, delay=0.3), "live")
+        self.assertTrue(self.app.live_fallback)
+
+
+class FrameWaitTests(DisplayFallbackTests):
+    """The display loop sleeps until a producer has something, instead of spinning."""
+
+    def test_the_loop_wakes_as_soon_as_a_frame_is_ready(self):
+        self.app.frame_ready.set()
+        started = time.perf_counter()
+        self.app._wait_for_frame(timeout=1.0)
+        self.assertLess(time.perf_counter() - started, 0.2)
+        self.assertFalse(self.app.frame_ready.is_set())          # and it is cleared
+
+    def test_without_a_frame_it_waits_at_most_the_timeout(self):
+        started = time.perf_counter()
+        self.app._wait_for_frame(timeout=0.02)
+        self.assertGreaterEqual(time.perf_counter() - started, 0.015)
+
+    def test_the_post_processing_worker_signals_new_frames(self):
+        self.app.process_queue = Queue(maxsize=2)
+        self.app.process_queue.put("frame")
+        self.app.display_queue = Queue(maxsize=2)
+        self.app.running = True
+        worker = threading.Thread(target=self.app.post_processing_worker, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(self.app.frame_ready.wait(1.0))
+            self.assertEqual(self.app.display_queue.get_nowait(), "frame")
+        finally:
+            self.app.running = False
+            worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+
+    def test_the_capture_only_wakes_the_loop_while_it_is_showing_captures(self):
+        self.app.want_live_frames = False
+        self.app._publish_live_frame("frame")
+        self.assertFalse(self.app.frame_ready.is_set())          # FG healthy: stay asleep
+        self.app.want_live_frames = True
+        self.app._publish_live_frame("frame")
+        self.assertTrue(self.app.frame_ready.is_set())
 
 
 class ModeChipTests(DisplayFallbackTests):
@@ -169,13 +271,29 @@ class LiveRenderConsistencyTests(DisplayFallbackTests):
     def publish(self, frame="frame"):
         self.app._publish_live_frame(frame)
 
-    def test_every_live_frame_uses_the_same_render(self):
-        for _ in range(30):
-            self.publish()
-        self.assertEqual(len(self.rendered), 30)      # never degrades to a cheap path
+    def test_the_capture_thread_never_renders(self):
+        """Rendering here would slow the capture, and every stage feeds off it."""
+        for index in range(30):
+            self.publish(f"frame-{index}")
+        self.assertEqual(self.rendered, [])
+        self.assertEqual(self.app._newest_live_frame(), "frame-29")
+
+    def test_the_display_loop_renders_one_image_per_captured_frame(self):
+        self.publish("frame")
+        self.assertIs(self.app._live_frame_for_display(), "frame")
+        self.assertIs(self.app._live_frame_for_display(), "frame")   # held: not rendered twice
+        self.assertEqual(len(self.rendered), 1)
+
+    def test_a_new_capture_is_rendered_again(self):
+        self.publish("first")
+        self.app._live_frame_for_display()
+        self.publish("second")
+        self.assertIs(self.app._live_frame_for_display(), "second")
+        self.assertEqual(len(self.rendered), 2)
 
     def test_the_cost_keeps_being_measured(self):
         self.publish()
+        self.app._live_frame_for_display()
         self.assertGreater(self.app.live_render_ms, 0.0)
 
     def test_a_costly_render_is_written_to_the_log_once(self):
@@ -183,15 +301,15 @@ class LiveRenderConsistencyTests(DisplayFallbackTests):
         original = self.module.diagnostics.write_now
         self.module.diagnostics.write_now = lambda label, message: messages.append(message)
         self.addCleanup(setattr, self.module.diagnostics, "write_now", original)
-        for _ in range(20):
-            self.publish()
+        for index in range(20):
+            self.publish(f"frame-{index}")
+            self.app._live_frame_for_display()
         complaints = [message for message in messages if "frames ao vivo custam" in message]
         self.assertEqual(len(complaints), 1)
         self.assertIn("LIVE", complaints[0])
 
-    def test_the_frame_reaches_the_display_queue_even_when_it_is_expensive(self):
-        self.publish("frame")
-        self.assertEqual(self.app._newest_live_frame(), "frame")
+    def test_a_frame_with_nothing_new_yet_returns_none(self):
+        self.assertIsNone(self.app._live_frame_for_display())
 
     def test_display_sized_frames_are_not_resized_again(self):
         app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
@@ -392,6 +510,7 @@ class PeriodicReportTests(unittest.TestCase):
         self.app.live_fallback = False
         self.app.frame_multiplier = 2
         self.app.dropped_generated = 0
+        self.app.capture_fps = 61.4
         self.app.display_queue = Queue(maxsize=5)
         self.app.display_queue.put("frame")
         self.app._queue_report = lambda size=None: "filas teste"
@@ -410,6 +529,18 @@ class PeriodicReportTests(unittest.TestCase):
         self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))
 
 
+
+    def test_the_report_includes_all_three_rates(self):
+        self.app._log_periodic_status(6.0, 0.0)
+        report = self.messages[0]
+        self.assertIn("FPS exibidos", report)
+        self.assertIn("gerados/s", report)
+        self.assertIn("captura 61.4/s", report)
+
+    def test_an_unmeasured_capture_rate_is_shown_as_unknown(self):
+        self.app.capture_fps = 0.0
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertIn("captura   ?", self.messages[0])
 
     def test_the_log_says_where_the_frames_came_from(self):
         self.app.live_fallback = True
