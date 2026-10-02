@@ -148,6 +148,32 @@ comum os números são bem menores:
 | Conversão BGRA→RGB (BitBlt) | ~11 ms | ~0,3 ms (`cv2.cvtColor`) |
 | Upscale Lanczos | ~22 ms | bicúbico, ~2 ms |
 
+## FPS de saída: fixo ou ilimitado
+
+Por padrão a saída é fixa (30 a 120 FPS no menu) e a captura é agendada a partir
+dela: **FPS ÷ multiplicador**. Em x2 a 120 FPS, o jogo é capturado a 60 FPS e os 60
+frames que faltam são interpolados — o overlay entrega exatamente 120 por segundo.
+
+O botão **Ilimitado (sem vsync)**, ao lado dos presets de FPS, tira esse teto:
+
+- **Saída sem ritmo**: cada quadro pronto é apresentado na hora, sem esperar intervalo
+  nenhum (o overlay já não usa vsync — nem no caminho SDL/D3D11 — então nada mais
+  segura a apresentação).
+- **Captura sem agendamento**: a captura deixa de ser "1 a cada 16 ms" e passa a pegar
+  **todo quadro novo que o jogo produz**, no ritmo real dele. Em x2, cada quadro
+  capturado continua rendendo um interpolado — 60 FPS de jogo viram 120 na tela, e um
+  jogo a 144 FPS vira 288.
+- **Nada de repetir à toa**: com teto, repetir a imagem segurada é inofensivo (o overlay
+  apresenta no relógio); sem teto, a mesma imagem não é apresentada duas vezes — ela só
+  inflaria o contador e queimaria CPU.
+- O limite de geração do worker passa a ser o intervalo real entre capturas, então um
+  motor que não acompanha simplesmente não gera os extras (a imagem continua no ritmo do
+  jogo, nunca um slideshow) — e, se o **Auto** estiver ligado, a resolução interna desce
+  um degrau para o gerador dar conta.
+
+Quando o modo ilimitado está ligado, o slider de FPS e os presets ficam desabilitados
+(não têm efeito) e o resumo do rodapé passa a mostrar `FPS ilimitado`.
+
 ### Resolução interna
 
 A resolução em que a pipeline trabalha é escolhida em **Configurações → FILTROS →
@@ -204,6 +230,8 @@ Além disso:
   meio segundo e só volta para `FG` depois de outro meio segundo de frames gerados — e
   enquanto isso a imagem continua na captura, sem alternar. O chip também mostra a taxa
   real de geração (por exemplo, `FG 118/s`).
+- Com **Ilimitado (sem vsync)** ligado, não há agendamento nenhum: a captura roda a cada
+  quadro novo do jogo e a apresentação acontece assim que um quadro fica pronto.
 - O contador de FPS é medido de verdade, numa janela de meio segundo: se a pipeline
   não acompanhar, o número cai em vez de mentir.
 - O processo do overlay roda com prioridade alta; o worker de interpolação roda com

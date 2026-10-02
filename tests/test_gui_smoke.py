@@ -152,6 +152,31 @@ class RealTkSmokeTests(unittest.TestCase):
         self.assertEqual(reopened.sources["0"]["hwnd"], 100)
         self.assertEqual(reopened.selected_title_var.get(), "Game — new session")
 
+    def test_unlimited_button_caps_the_rate_controls_and_reaches_the_overlay(self):
+        ui = self.make_ui()
+        self.assertEqual(str(ui.fps_scale.cget("state")), "normal")
+        ui.unlimited_button.invoke()
+        ui.root.update()
+        self.assertTrue(ui.unlimited_var.get())
+        self.assertEqual(str(ui.fps_scale.cget("state")), "disabled")
+        self.assertEqual(str(ui.fps_presets[120].cget("state")), "disabled")
+        self.assertEqual(ui.fps_value_var.get(), "Unlimited")
+        self.assertIn("output unlimited", ui.multiplier_hint_var.get())
+        self.assertIn("Unlimited FPS", ui.session_summary_var.get())
+        self.run_pending_save(ui)
+        self.assertTrue(self.store.load()["unlimited_fps"])
+        ui.tree.selection_set("0")
+        ui._on_select()
+        self.assertTrue(ui.selected_source["unlimited_fps"])
+        # Turning it off gives the rate controls back and saves the change.
+        reopened = self.make_ui()
+        reopened.unlimited_button.invoke()
+        reopened.root.update()
+        self.assertFalse(reopened.unlimited_var.get())
+        self.assertEqual(str(reopened.fps_scale.cget("state")), "normal")
+        self.run_pending_save(reopened)
+        self.assertFalse(self.store.load()["unlimited_fps"])
+
     def test_frame_generation_slider_saves_and_reaches_the_overlay(self):
         ui = self.make_ui()
         # Only even multipliers up to twenty are offered.

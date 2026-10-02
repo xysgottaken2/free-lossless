@@ -33,7 +33,7 @@ class SelectionUITests(unittest.TestCase):
                      "settings_store", "fps_value_var", "sharp_value_var", "engine_combo", "session_summary_var",
                      "algo_hint_var", "algo_combo", "sharp_scale", "filters_hint_var", "filters_hint_label",
                      "filter_combo", "filter_hint_var", "reshade_hint_var", "reshade_hint_label",
-                     "internal_res_combo"):
+                     "internal_res_combo", "unlimited_button", "fps_scale"):
             setattr(self.ui, name, MagicMock())
         self.ui.tree.get_children.return_value = ["stale-window"]
         self.ui.tree.selection.return_value = []
@@ -239,6 +239,31 @@ class SelectionUITests(unittest.TestCase):
         self.assertFalse(self.ui._collect_settings()["filters_enabled"])
         self.ui.filters_var.value = True
         self.assertTrue(self.ui._collect_settings()["filters_enabled"])
+
+    def test_unlimited_turns_off_the_rate_controls(self):
+        self.ui.unlimited_var.value = True
+        self.ui._update_setting_display()
+        self.assertEqual(str(self.ui.fps_scale.configure.call_args.kwargs["state"]),
+                         str(self.deps["tkinter"].DISABLED))
+        self.assertEqual(self.ui.fps_value_var.set.call_args.args[0], "Unlimited")
+
+    def test_the_rate_controls_come_back_when_unlimited_is_off(self):
+        self.ui.unlimited_var.value = False
+        self.ui._update_setting_display()
+        self.assertEqual(str(self.ui.fps_scale.configure.call_args.kwargs["state"]),
+                         str(self.deps["tkinter"].NORMAL))
+        self.assertIn("90", self.ui.fps_value_var.set.call_args.args[0])
+
+    def test_unlimited_is_saved_and_reloaded(self):
+        self.ui.unlimited_var.value = True
+        self.assertTrue(self.ui._collect_settings()["unlimited_fps"])
+        self.ui.unlimited_var.value = False
+        self.assertFalse(self.ui._collect_settings()["unlimited_fps"])
+
+    def test_the_multiplier_hint_has_no_capture_schedule_in_unlimited(self):
+        self.ui.unlimited_var.value = True
+        self.ui._update_setting_display()
+        self.assertIn("unlimited", str(self.ui.multiplier_hint_var.set.call_args).lower())
 
     def test_the_internal_resolution_is_saved_and_reloaded(self):
         self.ui.internal_res_var.value = "HD"

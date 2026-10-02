@@ -303,6 +303,14 @@ class AutoAdaptationTests(unittest.TestCase):
         self.assertFalse(app._auto_adapt(10.0))
         self.assertEqual(app.internal_res, (1920, 1080))
 
+    def test_in_unlimited_the_reference_is_what_is_on_screen(self):
+        """No configured rate to hit: the target is the rate being displayed."""
+        app = self.app(target_fps=120)
+        app.unlimited_fps = True
+        app.current_fps = 40.0
+        app._auto_probe_generated = 20          # 2 frames/s against a 20/s target
+        self.assertTrue(app._auto_adapt(10.0))
+
     def test_a_single_capture_pass_does_not_need_the_generator(self):
         for multiplier, fg in ((1, True), (2, False)):
             with self.subTest(multiplier=multiplier, fg=fg):

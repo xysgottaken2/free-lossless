@@ -36,6 +36,9 @@ DEFAULT_SETTINGS = {
     "source_type": "window",
     "mode": "bitblt",
     "fps": 60,
+    # "Unlimited": no pacing at all — the capture follows the game's real rate and the
+    # overlay presents as fast as the machine can, instead of a fixed output rate.
+    "unlimited_fps": False,
     "scale": "1.0",
     "algo": "Lanczos",
     "sharpness": 20,
@@ -138,7 +141,7 @@ def normalize_settings(data):
     if result["frame_multiplier"] % MULTIPLIER_STEP:
         result["frame_multiplier"] = DEFAULT_SETTINGS["frame_multiplier"]
     for key in ("fg_enabled", "filters_enabled", "ultra_smooth", "performance_mode",
-                "low_latency", "show_fps"):
+                "low_latency", "show_fps", "unlimited_fps"):
         if isinstance(data.get(key), bool):
             result[key] = data[key]
     result["language"] = i18n.normalize_language(data.get("language"))

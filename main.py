@@ -92,14 +92,37 @@ def hotkey_vk_code(name, fallback):
     return fallback
 
 
-def capture_interval(target_fps, multiplier):
-    """Seconds between captures: FPS / multiplier, so generated frames fill the rest."""
+def capture_interval(target_fps, multiplier, unlimited=False):
+    """Seconds between captures: FPS / multiplier, so generated frames fill the rest.
+
+    With ``unlimited`` there is no schedule at all: the capture runs every time the
+    source produces a new frame, and the multiplier is applied on top of that rate
+    by the generator instead of being carved out of a fixed output rate.
+    """
+    if unlimited:
+        return 0.0
     try:
         multiplier = max(1, int(multiplier or 1))
     except (TypeError, ValueError):
         multiplier = 2
     rate = (target_fps / multiplier) if target_fps and target_fps > 0 else (30.0 / multiplier)
     return 1.0 / rate if rate > 0 else 1.0
+
+
+def display_interval(target_fps, unlimited=False):
+    """Seconds between presented frames; ``0.0`` means "present every frame we have"."""
+    if unlimited:
+        return 0.0
+    try:
+        target_fps = int(target_fps)
+    except (TypeError, ValueError):
+        target_fps = 60
+    return 1.0 / target_fps if target_fps > 0 else 0.0
+
+
+# Nothing new arrived: how long the capture and the presentation loops wait before
+# looking again. Small enough to catch the next real frame, long enough not to spin.
+UNLIMITED_IDLE_SLEEP = 0.0005
 
 
 # Generation may use at most this share of the capture interval; the rest is
@@ -261,13 +284,15 @@ def queue_sizes(multiplier, low_latency=True):
     return 2, process_size, display_size
 
 
-def effective_capture_multiplier(fg_enabled, multiplier):
+def effective_capture_multiplier(fg_enabled, multiplier, unlimited=False):
     """Interpolation fills the gaps, so captures slow down by the multiplier.
 
     With generation disabled nothing fills those gaps, so the capture has to keep
-    the full target rate or the overlay would run at a fraction of it.
+    the full target rate or the overlay would run at a fraction of it. Unlimited is
+    the same idea for the opposite reason: the capture takes every real frame (the
+    game's own rate) and the generator adds the intermediates on top of it.
     """
-    if not fg_enabled:
+    if unlimited or not fg_enabled:
         return 1
     try:
         return max(1, int(multiplier or 2))
@@ -459,6 +484,10 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
 class FrameGenerationApp:
     def __init__(self, target_fps=60):
         self.target_fps = target_fps
+        # Unlimited: no output pacing — the capture follows the game and the overlay
+        # presents every frame as soon as it is ready.
+        self.unlimited_fps = False
+        self.last_presented_frame = None
         self.capture = None
         self.engine = RIFEEngine()
         self.running = False
@@ -524,9 +553,10 @@ class FrameGenerationApp:
     def capture_worker(self):
         print("Capture worker started")
         last_frame = None
+        unlimited = bool(getattr(self, "unlimited_fps", False))
         multiplier = effective_capture_multiplier(getattr(self, "fg_enabled", True),
-                                                   getattr(self, "frame_multiplier", 2))
-        interval = capture_interval(self.target_fps, multiplier)
+                                                   getattr(self, "frame_multiplier", 2), unlimited)
+        interval = capture_interval(self.target_fps, multiplier, unlimited)
 
         last_capture_time = time.perf_counter()
 
@@ -580,6 +610,11 @@ class FrameGenerationApp:
                             self.live_publish_time = now_publish
                             self._publish_live_frame(frame)
                         put_latest(self.capture_queue, frame)
+                    elif unlimited:
+                        # Nothing new on screen: back off a fraction of a millisecond
+                        # instead of re-capturing in a tight loop. A game running at
+                        # 60 Hz is still picked up with the next refresh.
+                        time.sleep(UNLIMITED_IDLE_SLEEP)
         finally:
             # Release DXGI/GDI resources on the same worker that used them.
             self.capture.stop_capture()
@@ -711,6 +746,15 @@ class FrameGenerationApp:
         self.last_frame_generated = from_generator
         return frame
 
+    def _repeat_of_presented(self, frame):
+        """True when the same image would go to the screen a second time.
+
+        With a fixed output rate the overlay presents on a schedule, so repeating the
+        held image is harmless. Unlimited presents on every new frame, and presenting
+        the same picture again would only burn CPU and inflate the counter.
+        """
+        return bool(self.unlimited_fps) and frame is self.last_presented_frame
+
     PERIODIC_REPORT_SECONDS = 5.0
 
     def _log_periodic_status(self, loop_now, diagnostics_time):
@@ -789,7 +833,12 @@ class FrameGenerationApp:
         elapsed = now - getattr(self, "_auto_probe_start", now)
         if elapsed < AUTO_PROBE_SECONDS:
             return False
-        required = self.target_fps * (self.frame_multiplier - 1) / self.frame_multiplier
+        # In unlimited mode there is no configured rate to hit: the reference is what
+        # the overlay is actually showing. If the generator delivers less than its
+        # share of that, it is the bottleneck — and lowering the processing resolution
+        # is exactly what raises the number of frames the machine can produce.
+        reference = self.current_fps if getattr(self, "unlimited_fps", False) else self.target_fps
+        required = reference * (self.frame_multiplier - 1) / self.frame_multiplier
         achieved = getattr(self, "_auto_probe_generated", 0) / elapsed
         if achieved >= required * AUTO_PROBE_MIN_RATIO:
             self._auto_probe_start = now     # healthy: watch the next window
@@ -1012,6 +1061,7 @@ class FrameGenerationApp:
             region=rect, mode=self.target_source["mode"], desktop_coordinates=True,
         )
         self.target_fps = self.target_source["fps"]
+        self.unlimited_fps = bool(self.target_source.get("unlimited_fps", False))
         
         # Scaling config
         scale_val = self.target_source["scale"]
@@ -1095,7 +1145,9 @@ class FrameGenerationApp:
 
         self._set_internal_resolution(rect)
 
-        print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | FPS: {self.target_fps} | Scale: {scale_val} | Frame gen: x{multiplier}")
+        rate_label = "unlimited" if self.unlimited_fps else f"{self.target_fps} FPS"
+        print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | "
+              f"FPS: {rate_label} | Scale: {scale_val} | Frame gen: x{multiplier}")
         print(f"Press {self.hotkey_names['stop']} to stop, {self.hotkey_names['fps']} to toggle FPS, "
               f"{self.hotkey_names['fsr']} to toggle FSR.")
         return True
@@ -1238,15 +1290,19 @@ class FrameGenerationApp:
         p_proc.start()
         t_post.start()
         
-        frame_interval = 1.0 / self.target_fps
+        unlimited = bool(getattr(self, "unlimited_fps", False))
+        frame_interval = display_interval(self.target_fps, unlimited)
+        # The reference interval still comes from the configured rate: in unlimited
+        # mode it is what tells the overlay how long a "short" hiccup lasts.
+        reference_interval = display_interval(self.target_fps)
         # Live frames are rendered in the capture thread: half a frame interval is what
         # it may spend without holding the captures back.
-        self.live_render_budget_ms = max(1.0, frame_interval * 1000.0 * 0.5)
+        self.live_render_budget_ms = max(1.0, reference_interval * 1000.0 * 0.5)
         # The generator needs to miss a whole frame before LIVE frames take over, and
         # it has to prove it recovered before generated frames come back. Without the
         # second delay the two sources alternate every frame, which the eye reads as
         # flicker.
-        stall_timeout = max(frame_interval * 2, 0.03)
+        stall_timeout = max(reference_interval * 2, 0.03)
         return_delay = max(stall_timeout * 3, 0.3)
         last_display_time = time.perf_counter()
         fps_window_start = last_display_time
@@ -1255,10 +1311,12 @@ class FrameGenerationApp:
         diagnostics_time = last_display_time
         last_style_check = last_display_time
         self.sync_counter = 0
+        self.last_presented_frame = None
         diagnostics.reset()
         diagnostics.write_now("início", f"overlay {self.display_dim[0]}x{self.display_dim[1]} · "
                                         f"interno {self.internal_res[0]}x{self.internal_res[1]} · "
-                                        f"{self.target_fps} FPS · geração x{self.frame_multiplier} · "
+                                        f"{'ilimitado' if unlimited else f'{self.target_fps} FPS'} · "
+                                        f"geração x{self.frame_multiplier} · "
                                         f"motor {self.target_source.get('engine_type')} · "
                                         f"filtros {'ligados' if self.filters_enabled else 'desligados'}")
 
@@ -1309,6 +1367,12 @@ class FrameGenerationApp:
                 frame = self._pick_frame(now, min_buffer, stall_timeout, return_delay)
 
                 if frame is not None:
+                    if self._repeat_of_presented(frame):
+                        # Nothing new arrived: presenting the same picture again would
+                        # only burn CPU and inflate the frame counter.
+                        time.sleep(UNLIMITED_IDLE_SLEEP)
+                        continue
+                    self.last_presented_frame = frame
                     last_display_time = now
                     
                     # Window sync: checking 15 times a second is enough to follow

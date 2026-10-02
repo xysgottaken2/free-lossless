@@ -66,7 +66,7 @@ class GameSelectorUI:
         "scale": "scale_var", "algo": "algo_var", "sharpness": "sharp_var",
         "fg_enabled": "fg_var", "filters_enabled": "filters_var", "engine_type": "engine_var",
         "filter_preset": "filter_var", "display_mode": "display_mode_var",
-        "internal_resolution": "internal_res_var",
+        "internal_resolution": "internal_res_var", "unlimited_fps": "unlimited_var",
         "ultra_smooth": "ultra_smooth_var", "performance_mode": "perf_mode_var",
         "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
         "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
@@ -432,6 +432,14 @@ class GameSelectorUI:
             button.config(padx=4, pady=5, font=("Segoe UI", 9))
             button.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0))
             self.fps_presets[value] = button
+        # Unlimited is a mode of its own, not another rate: it removes the output cap
+        # (and the capture schedule) entirely, so it gets its own button.
+        self.unlimited_button = self._button(presets, _t("fps.unlimited"),
+                                             self._toggle_unlimited)
+        self.unlimited_button.config(padx=4, pady=5, font=("Segoe UI", 9))
+        self.unlimited_button.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self._label(capture, _t("fps.unlimited_hint"), muted=True, size=9, justify=tk.LEFT).grid(
+            row=5, column=0, sticky="w", pady=(0, 8))
 
         image = self._section(parent, _t("section.image_quality"), 1)
         self._label(image, _t("field.algorithm"), size=9).grid(row=1, column=0, sticky="w", pady=(0, 6))
@@ -880,11 +888,24 @@ class GameSelectorUI:
         self.reshade_status_label.config(fg=COLORS["success"])
         reshade.open_folder(path)
 
+    def _toggle_unlimited(self):
+        """Turn the output cap (and the capture schedule) on or off.
+
+        While unlimited is on, the rate slider and the FPS presets cannot change
+        anything, so they are left disabled instead of silently ignored.
+        """
+        self.unlimited_var.set(not self.unlimited_var.get())
+
     def _update_setting_display(self):
         fps = self.fps_var.get()
         multiplier = self.multiplier_var.get()
         generation_on = bool(self.fg_var.get())
-        self.fps_value_var.set(f"{fps} FPS")
+        unlimited = bool(self.unlimited_var.get())
+        self.fps_value_var.set(_t("fps.unlimited_value") if unlimited else f"{fps} FPS")
+        self.unlimited_button.config(bg=COLORS["accent_dim"] if unlimited else COLORS["input"])
+        self.fps_scale.configure(state=tk.DISABLED if unlimited else tk.NORMAL)
+        for value, button in self.fps_presets.items():
+            button.config(state=tk.DISABLED if unlimited else tk.NORMAL)
         self.sharp_value_var.set(f"{self.sharp_var.get()}%")
         self.multiplier_value_var.set(_t("multiply.value", multiplier=multiplier))
         for value, button in self.fps_presets.items():
@@ -904,6 +925,10 @@ class GameSelectorUI:
         if not generation_on:
             hint = _t("multiply.disabled")
             tone = "muted"
+        elif unlimited:
+            # With no fixed output rate there is no capture schedule to compute.
+            hint = _t("multiply.hint_unlimited", extra=multiplier - 1)
+            tone = "warning" if multiplier >= 8 else "muted"
         else:
             fields = {"extra": multiplier - 1, "capture": max(1, round(fps / multiplier)), "fps": fps}
             hint = _t("multiply.warning" if multiplier >= 8 else "multiply.hint", **fields)
@@ -914,8 +939,13 @@ class GameSelectorUI:
                                        fps=self.hotkey_fps_var.get(), fsr=self.hotkey_fsr_var.get()))
         scale = (_t("footer.fullscreen") if self.scale_var.get() == "Fullscreen"
                  else f"{self.scale_var.get()}×")
-        self.session_summary_var.set(_t("footer.summary" if generation_on else "footer.summary_off",
-                                        fps=fps, scale=scale, multiplier=multiplier))
+        if not generation_on:
+            summary_key = "footer.summary_off"
+        elif unlimited:
+            summary_key = "footer.summary_unlimited"
+        else:
+            summary_key = "footer.summary"
+        self.session_summary_var.set(_t(summary_key, fps=fps, scale=scale, multiplier=multiplier))
 
     def _on_settings_change(self, *args):
         if self._loading_settings or self._closing:

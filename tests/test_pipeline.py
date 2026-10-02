@@ -306,12 +306,80 @@ class SelectionSettingsTests(unittest.TestCase):
         self.assertEqual(self.app.process_queue._maxsize, 8)
         self.assertEqual(self.app.display_queue.maxsize, 20)
 
+    def test_unlimited_is_applied_to_the_session(self):
+        self.with_source(unlimited_fps=True)
+        self.assertTrue(self.select())
+        self.assertTrue(self.app.unlimited_fps)
+        self.with_source(unlimited_fps=False)
+        self.assertTrue(self.select())
+        self.assertFalse(self.app.unlimited_fps)
+
     def test_saved_preferences_round_trip_into_the_selection(self):
         prefs = normalize_settings({"frame_multiplier": 8, "hotkey_stop": "F4",
-                                    "hotkey_fps": "F6", "hotkey_fsr": "F8", "show_fps": False})
+                                    "hotkey_fps": "F6", "hotkey_fsr": "F8", "show_fps": False,
+                                    "unlimited_fps": True})
         self.with_source(**{key: prefs[key] for key in ("frame_multiplier", "hotkey_stop",
-                                                        "hotkey_fps", "hotkey_fsr", "show_fps")})
+                                                        "hotkey_fps", "hotkey_fsr", "show_fps",
+                                                        "unlimited_fps")})
         self.assertTrue(self.select())
         self.assertEqual(self.app.frame_multiplier, 8)
         self.assertEqual(self.app.hotkeys["stop"], 0x73)
         self.assertFalse(self.app.show_fps)
+        self.assertTrue(self.app.unlimited_fps)
+
+class UnlimitedRateTests(unittest.TestCase):
+    """Unlimited removes the output schedule instead of picking another rate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def test_the_capture_has_no_schedule(self):
+        self.assertEqual(self.module.capture_interval(120, 2, unlimited=True), 0.0)
+        self.assertEqual(self.module.capture_interval(60, 20, unlimited=True), 0.0)
+
+    def test_an_unlimited_capture_takes_every_real_frame(self):
+        self.assertEqual(self.module.effective_capture_multiplier(True, 2, unlimited=True), 1)
+        self.assertEqual(self.module.effective_capture_multiplier(True, 20, unlimited=True), 1)
+        self.assertEqual(self.module.effective_capture_multiplier(False, 2, unlimited=True), 1)
+
+    def test_the_display_has_no_pacing(self):
+        self.assertEqual(self.module.display_interval(120, unlimited=True), 0.0)
+        self.assertEqual(self.module.display_interval(30), 1 / 30)
+        self.assertEqual(self.module.display_interval(0), 0.0)
+
+    def test_unlimited_still_respects_the_multiplier(self):
+        """x2 means two output frames for every captured frame, at any rate."""
+        multiplier = self.module.effective_capture_multiplier(True, 2, unlimited=True)
+        self.assertEqual(len(self.module.interpolation_timesteps(2)) + 1, 2 * multiplier)
+
+
+class RepeatPresentationTests(unittest.TestCase):
+    """The same picture is never presented twice while there is no fixed rate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def app(self, unlimited):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.unlimited_fps = unlimited
+        app.last_presented_frame = None
+        return app
+
+    def test_a_new_frame_is_always_presented(self):
+        app = self.app(True)
+        image = object()
+        self.assertFalse(app._repeat_of_presented(image))
+        app.last_presented_frame = image
+        self.assertTrue(app._repeat_of_presented(image))
+
+    def test_a_fixed_rate_may_repeat_the_held_image(self):
+        app = self.app(False)
+        image = object()
+        app.last_presented_frame = image
+        self.assertFalse(app._repeat_of_presented(image))
