@@ -1,0 +1,565 @@
+"""The overlay never stalls and its mode chip never flips frame by frame.
+
+Two problems used to show up on screen at the same time: the displayed image
+stopped whenever the frame generator could not keep up, and the status chip
+alternated between FG and LIVE on every frame, which reads as flicker.
+"""
+import threading
+import time
+import unittest
+from queue import Queue
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy ships in requirements.txt
+    np = None
+
+from helpers import load_module, silence_diagnostics, stubs
+
+
+class DisplayFallbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+
+    def setUp(self):
+        self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.display_queue = Queue(maxsize=8)
+        self.app.live_display_queue = Queue(maxsize=1)
+        self.app.last_live_display = None
+        self.app.live_publish_time = 0.0
+        self.app.want_live_frames = False
+        self.app.starving_since = None
+        self.app.healthy_since = None
+        self.app.live_fallback = False
+        self.app.last_frame_generated = False
+        self.app.dropped_generated = 0
+        self.app.frame_count = 1          # the first frame was already shown
+        self.app.last_shown_frame = None
+        # Live frames are rendered by the display loop now (the capture thread only
+        # hands over the prepared frame), so the loop needs the render path.
+        self.app._last_live_source = None
+        self.app._last_live_display = None
+        self.app.live_render_ms = 0.0
+        self.app.live_render_budget_ms = 4.0
+        self.app.live_cost_logged = False
+        self.app._render_for_display = lambda frame: frame
+        silence_diagnostics(self)
+        self.app.frame_ready = threading.Event()
+        self.module.print = lambda *args, **kwargs: None
+
+    def live(self, value):
+        """Publish a captured frame the way the capture worker does."""
+        self.app.last_live_display = value
+        self.app.live_display_queue.put(value)
+
+    def generated(self, value):
+        self.app.display_queue.put(value)
+
+    def pick(self, now, min_buffer=1, stall=0.5, delay=0.5):
+        return self.app._pick_frame(now, min_buffer, stall, delay)
+
+
+class ImageKeepsMovingTests(DisplayFallbackTests):
+    def test_the_image_never_stalls_when_the_generator_is_behind(self):
+        self.live("live")
+        self.assertIs(self.pick(0.0), "live")        # shown right away
+        self.assertFalse(self.app.live_fallback)     # while the chip still says FG
+        self.assertIs(self.pick(0.01), "live")
+
+    def test_a_generated_frame_is_preferred_over_the_capture(self):
+        self.live("live")
+        self.generated("generated")
+        self.assertIs(self.pick(0.0), "generated")
+        self.assertTrue(self.app.last_frame_generated)
+
+    def test_the_previous_capture_is_reused_instead_of_showing_nothing(self):
+        self.live("live")
+        self.pick(0.0)
+        self.assertIs(self.pick(0.01), "live")       # nothing new was captured
+
+    def test_old_generated_frames_are_dropped_instead_of_being_displayed_late(self):
+        self.live("live")
+        for index in range(6):
+            self.generated(f"generated-{index}")
+        self.assertEqual(self.pick(0.0, min_buffer=1), "generated-5")  # the newest one
+        self.assertTrue(self.app.display_queue.empty())
+        self.assertEqual(self.app.dropped_generated, 5)
+
+    def test_the_buffered_mode_keeps_a_small_backlog_only(self):
+        for index in range(6):
+            self.generated(f"generated-{index}")
+        self.pick(0.0, min_buffer=3)
+        self.assertEqual(self.app.display_queue.qsize(), 2)          # never grows further
+
+
+class StallRuleTests(unittest.TestCase):
+    """When a missing frame counts as a stall — the rule that kept unlimited at 20 FPS."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module("main", stubs("cv2", "numpy", "pygame", "capture", "engine",
+                                               "ui", "selector", "filters", "win32gui",
+                                               "win32api", "win32con", "tkinter"), runtime=True)
+
+    def rule(self, unlimited, interval, capture_fps=0.0):
+        return self.module.stall_timeout_seconds(unlimited, interval, capture_fps)
+
+    def test_a_fixed_rate_keeps_the_presentation_reference(self):
+        self.assertAlmostEqual(self.rule(False, 1 / 30), 2 / 30)  # two frame intervals
+        self.assertEqual(self.rule(False, 1 / 120), 0.03)         # never below the floor
+
+    def test_unlimited_uses_the_measured_capture_rate(self):
+        self.assertAlmostEqual(self.rule(True, 1 / 120, 20.0), 0.15)
+        self.assertAlmostEqual(self.rule(True, 1 / 120, 240.0), 0.12)   # floor
+
+    def test_unlimited_before_the_first_measurement_uses_the_floor(self):
+        self.assertEqual(self.rule(True, 1 / 120, -1.0), 0.12)
+
+    def test_a_slow_capture_is_not_a_stall_but_a_frozen_pipeline_still_is(self):
+        timeout = self.rule(True, 1 / 120, 20.0)
+        self.assertLess(1 / 20, timeout)      # 50 ms between frames is normal at 20 FPS
+        self.assertGreater(0.4, timeout)      # four hundred milliseconds is not
+
+
+class UnlimitedStallTests(DisplayFallbackTests):
+    """The actual complaint: a 20 FPS capture pinned the overlay at 20 FPS in unlimited."""
+
+    def test_a_slow_but_steady_capture_is_not_a_stall(self):
+        timeout = self.module.stall_timeout_seconds(True, 1 / 120, 20.0)
+        now = 0.0
+        for step in range(40):                       # eight seconds at 20 FPS
+            frame = f"generated-{step}"              # same object for publish and check
+            self.generated(frame)
+            self.assertIs(self.pick(now, stall=timeout, delay=0.3), frame)
+            self.assertFalse(self.app.live_fallback, f"LIVE entrou no passo {step}")
+            now += 1 / 20
+
+    def test_a_frozen_pipeline_still_falls_back(self):
+        timeout = self.module.stall_timeout_seconds(True, 1 / 120, 20.0)
+        self.live("live")
+        self.generated("generated")
+        self.pick(0.0, stall=timeout, delay=0.3)
+        self.pick(0.4, stall=timeout, delay=0.3)     # nothing new: starving starts
+        self.assertFalse(self.app.live_fallback)
+        self.assertIs(self.pick(0.4 + timeout + 0.01, stall=timeout, delay=0.3), "live")
+        self.assertTrue(self.app.live_fallback)
+
+
+class FrameWaitTests(DisplayFallbackTests):
+    """The display loop sleeps until a producer has something, instead of spinning."""
+
+    def test_the_loop_wakes_as_soon_as_a_frame_is_ready(self):
+        self.app.frame_ready.set()
+        started = time.perf_counter()
+        self.app._wait_for_frame(timeout=1.0)
+        self.assertLess(time.perf_counter() - started, 0.2)
+        self.assertFalse(self.app.frame_ready.is_set())          # and it is cleared
+
+    def test_without_a_frame_it_waits_at_most_the_timeout(self):
+        started = time.perf_counter()
+        self.app._wait_for_frame(timeout=0.02)
+        self.assertGreaterEqual(time.perf_counter() - started, 0.015)
+
+    def test_the_post_processing_worker_signals_new_frames(self):
+        self.app.process_queue = Queue(maxsize=2)
+        self.app.process_queue.put("frame")
+        self.app.display_queue = Queue(maxsize=2)
+        self.app.running = True
+        worker = threading.Thread(target=self.app.post_processing_worker, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(self.app.frame_ready.wait(1.0))
+            self.assertEqual(self.app.display_queue.get_nowait(), "frame")
+        finally:
+            self.app.running = False
+            worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+
+    def test_the_capture_only_wakes_the_loop_while_it_is_showing_captures(self):
+        self.app.want_live_frames = False
+        self.app._publish_live_frame("frame")
+        self.assertFalse(self.app.frame_ready.is_set())          # FG healthy: stay asleep
+        self.app.want_live_frames = True
+        self.app._publish_live_frame("frame")
+        self.assertTrue(self.app.frame_ready.is_set())
+
+
+class ModeChipTests(DisplayFallbackTests):
+    def test_the_chip_only_says_live_after_a_sustained_stall(self):
+        self.live("live")
+        self.pick(0.0, stall=0.5)
+        self.pick(0.2, stall=0.5)
+        self.assertFalse(self.app.live_fallback)
+        self.pick(0.6, stall=0.5)
+        self.assertTrue(self.app.live_fallback)
+
+    def test_one_generated_frame_does_not_flip_the_chip_back(self):
+        self.live("live")
+        self.pick(0.0, stall=0.5)
+        self.pick(0.6, stall=0.5)
+        self.assertTrue(self.app.live_fallback)
+        self.generated("generated")
+        # The chip stays on LIVE and so does the image: a single good frame in the
+        # middle of an episode must not change what is on screen, not even for one
+        # frame (that swap is what the user sees as flicker).
+        self.assertIs(self.pick(0.7, stall=0.5, delay=0.5), "live")
+        self.assertTrue(self.app.live_fallback)
+        self.assertFalse(self.app.last_frame_generated)
+
+    def test_the_chip_returns_to_fg_after_the_generator_keeps_up(self):
+        self.live("live")
+        self.pick(0.0, stall=0.5)
+        self.pick(0.6, stall=0.5)
+        for step, moment in enumerate((0.7, 0.9, 1.1)):
+            self.generated(f"generated-{step}")
+            self.pick(moment, stall=0.5, delay=0.5)
+            self.assertTrue(self.app.live_fallback)  # still recovering
+        self.generated("generated-late")
+        self.pick(1.2, stall=0.5, delay=0.5)         # half a second of good frames
+        self.assertFalse(self.app.live_fallback)
+
+    def test_the_chip_never_changes_twice_in_the_same_moment(self):
+        """Half of the frames generated must still stay on a single chip."""
+        self.live("live")
+        self.pick(0.0, stall=0.03)
+        self.pick(0.05, stall=0.03)                  # entered LIVE
+        changes = 0
+        previous = self.app.live_fallback
+        for step in range(20):
+            now = 0.1 + step * 0.01
+            self.generated(f"generated-{step}")
+            self.pick(now, stall=0.03, delay=0.5)
+            if self.app.live_fallback != previous:
+                changes += 1
+                previous = self.app.live_fallback
+        self.assertEqual(changes, 0)
+
+
+class LiveRenderConsistencyTests(DisplayFallbackTests):
+    """Live frames are rendered exactly like generated ones.
+
+    An earlier version switched to a cheap render when the cost went over budget. The
+    cost hovers around that budget, so consecutive frames alternated between sharp and
+    soft — the flicker the user reported. The look is now fixed; the cost is logged.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.app.display_dim = (1920, 1080)
+        self.app.filters_enabled = True
+        self.app.fsr_mode = False
+        self.app.ai_mode = False
+        self.app.ai_upscaler = None
+        self.app.sharpness = 1.0
+        self.app.upscale_algo = 1
+        self.app.filter_chain = None
+        self.app.live_render_ms = 0.0
+        self.app.live_render_budget_ms = 4.0
+        self.app.live_cost_logged = False
+        self.rendered = []
+        self.app._render_for_display = self.expensive_render
+
+    def expensive_render(self, frame):
+        """Stands in for a render that costs far more than the frame budget."""
+        time.sleep(0.006)
+        self.rendered.append("full")
+        return frame
+
+    def publish(self, frame="frame"):
+        self.app._publish_live_frame(frame)
+
+    def test_the_capture_thread_never_renders(self):
+        """Rendering here would slow the capture, and every stage feeds off it."""
+        for index in range(30):
+            self.publish(f"frame-{index}")
+        self.assertEqual(self.rendered, [])
+        self.assertEqual(self.app._newest_live_frame(), "frame-29")
+
+    def test_the_display_loop_renders_one_image_per_captured_frame(self):
+        self.publish("frame")
+        self.assertIs(self.app._live_frame_for_display(), "frame")
+        self.assertIs(self.app._live_frame_for_display(), "frame")   # held: not rendered twice
+        self.assertEqual(len(self.rendered), 1)
+
+    def test_a_new_capture_is_rendered_again(self):
+        self.publish("first")
+        self.app._live_frame_for_display()
+        self.publish("second")
+        self.assertIs(self.app._live_frame_for_display(), "second")
+        self.assertEqual(len(self.rendered), 2)
+
+    def test_the_cost_keeps_being_measured(self):
+        self.publish()
+        self.app._live_frame_for_display()
+        self.assertGreater(self.app.live_render_ms, 0.0)
+
+    def test_a_costly_render_is_written_to_the_log_once(self):
+        messages = []
+        original = self.module.diagnostics.write_now
+        self.module.diagnostics.write_now = lambda label, message: messages.append(message)
+        self.addCleanup(setattr, self.module.diagnostics, "write_now", original)
+        for index in range(20):
+            self.publish(f"frame-{index}")
+            self.app._live_frame_for_display()
+        complaints = [message for message in messages if "frames ao vivo custam" in message]
+        self.assertEqual(len(complaints), 1)
+        self.assertIn("LIVE", complaints[0])
+
+    def test_a_frame_with_nothing_new_yet_returns_none(self):
+        self.assertIsNone(self.app._live_frame_for_display())
+
+    def test_display_sized_frames_are_not_resized_again(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1920, 1080)
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.assertIs(app._fit_display(frame), frame)
+
+    def test_downscaling_to_the_display_uses_area_averaging(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1280, 720)
+        app._fit_display(np.zeros((1080, 1920, 3), dtype=np.uint8))
+        self.assertIs(self.deps["cv2"].resize.call_args.kwargs["interpolation"],
+                      self.deps["cv2"].INTER_AREA)
+
+    def test_upscaling_to_the_display_stays_cheap(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1920, 1080)
+        app._fit_display(np.zeros((540, 960, 3), dtype=np.uint8))
+        self.assertIs(self.deps["cv2"].resize.call_args.kwargs["interpolation"],
+                      self.deps["cv2"].INTER_LINEAR)
+
+
+class StickySourceTests(DisplayFallbackTests):
+    """The image source only changes for a sustained reason.
+
+    A single late generated frame used to swap the image for exactly one frame
+    (interpolated, real, interpolated), which is visible as flicker.
+    """
+
+    def test_a_hickup_repeats_the_last_image_instead_of_swapping(self):
+        self.live("live")
+        self.generated("generated-0")
+        self.assertIs(self.pick(0.0), "generated-0")
+        # The generator misses one frame: the image stays the same for that frame.
+        self.assertIs(self.pick(0.01), "generated-0")
+        self.assertFalse(self.app.live_fallback)
+        self.assertFalse(self.app.last_frame_generated)
+
+    def test_a_stall_becomes_a_live_episode_after_the_window(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.assertIs(self.pick(0.0), "generated-0")
+        self.assertIs(self.pick(0.3), "generated-0")  # first miss: hold the image
+        self.assertIs(self.pick(0.6), "generated-0")  # still inside the window
+        self.assertFalse(self.app.live_fallback)
+        self.assertIs(self.pick(0.9), "live-0")       # window passed: LIVE episode
+        self.assertTrue(self.app.live_fallback)
+
+    def test_a_generated_frame_does_not_flip_the_image_mid_episode(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.6)                                # first miss (window starts)
+        self.assertIs(self.pick(1.0), "generated-0")  # 0.4 s: still holding
+        self.assertIs(self.pick(1.1), "live-0")       # 0.5 s: LIVE episode
+        self.assertTrue(self.app.live_fallback)
+        self.live("live-1")
+        self.generated("generated-1")
+        self.assertIs(self.pick(1.2), "live-1")       # stays on the capture
+        self.assertTrue(self.app.live_fallback)
+
+    def test_the_episode_ends_after_generation_is_healthy_for_a_while(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.3)                                # first miss
+        self.assertIs(self.pick(0.8), "live-0")       # 0.5 s: now in LIVE
+        self.assertTrue(self.app.live_fallback)
+        self.generated("generated-1")
+        self.pick(0.9)                                # healthy window starts here
+        self.assertTrue(self.app.live_fallback)
+        self.live("live-1")
+        self.generated("generated-2")
+        self.assertIs(self.pick(1.2), "live-1")       # 0.3 s: still LIVE
+        self.assertTrue(self.app.live_fallback)
+        self.generated("generated-3")
+        self.assertIs(self.pick(1.5), "generated-3")  # 0.6 s: back to FG
+        self.assertFalse(self.app.live_fallback)
+
+    def test_the_hud_never_sees_a_generated_frame_that_was_not_shown(self):
+        """A repeated frame is not counted as a freshly generated one."""
+        self.live("live")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.01)
+        self.assertFalse(self.app.last_frame_generated)
+
+    def test_a_long_stall_is_not_reported_before_the_window(self):
+        self.live("live")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.1)
+        self.assertFalse(self.app.live_fallback)
+
+
+class QueueReportTests(unittest.TestCase):
+    """The periodic diagnostics line must not crash with real queues.
+
+    ``multiprocessing.Queue`` has no ``maxsize`` attribute — it keeps the bound in
+    ``_maxsize`` — and reading it crashed the overlay five seconds into a session.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import multiprocessing
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+        cls.multiprocessing = multiprocessing
+
+    def queue_capacity(self, size):
+        process_queue = self.multiprocessing.Queue(maxsize=size)
+        self.addCleanup(process_queue.close)
+        return self.module.queue_capacity(process_queue)
+
+    def test_a_process_queue_reports_its_capacity(self):
+        self.assertEqual(self.queue_capacity(2), 2)
+        self.assertEqual(self.queue_capacity(7), 7)
+
+    def test_a_thread_queue_reports_its_capacity(self):
+        from queue import Queue
+        self.assertEqual(self.module.queue_capacity(Queue(maxsize=3)), 3)
+
+    def test_an_unknown_object_reports_zero_instead_of_raising(self):
+        self.assertEqual(self.module.queue_capacity(object()), 0)
+        self.assertEqual(self.module.queue_capacity(None), 0)
+
+    def test_the_report_line_works_with_the_queues_the_app_really_uses(self):
+        from queue import Queue
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.capture_queue = self.multiprocessing.Queue(maxsize=2)
+        app.process_queue = self.multiprocessing.Queue(maxsize=3)
+        app.display_queue = Queue(maxsize=5)
+        self.addCleanup(app.capture_queue.close)
+        self.addCleanup(app.process_queue.close)
+        line = app._queue_report()
+        self.assertIn("captura 0/2", line)
+        self.assertIn("pós 0/3", line)
+        self.assertIn("exibição 0/5", line)
+
+    def test_the_report_line_counts_what_is_waiting(self):
+        from queue import Queue
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.capture_queue = self.multiprocessing.Queue(maxsize=2)
+        app.process_queue = self.multiprocessing.Queue(maxsize=3)
+        app.display_queue = Queue(maxsize=5)
+        self.addCleanup(app.capture_queue.close)
+        self.addCleanup(app.process_queue.close)
+        app.display_queue.put("frame")
+        app.display_queue.put("frame")
+        self.assertIn("exibição 2/5", app._queue_report())
+
+    def test_the_loop_uses_the_report_helper(self):
+        """No direct ``.maxsize`` on a process queue may sneak back into the loop."""
+        import inspect
+        source = inspect.getsource(self.module.FrameGenerationApp.run)
+        self.assertNotIn(".maxsize", source)
+        self.assertIn("_log_periodic_status", source)
+
+    def test_no_direct_queue_attribute_access_survives_anywhere(self):
+        """``.maxsize`` may only be read through ``queue_capacity``.
+
+        Checked on the syntax tree, not on the text: a docstring that mentions the
+        attribute is fine, an access is not.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        def attribute_names(source):
+            tree = ast.parse(textwrap.dedent(source))
+            return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+        for name in ("run", "_log_periodic_status", "_queue_report"):
+            with self.subTest(method=name):
+                attributes = attribute_names(inspect.getsource(getattr(self.module.FrameGenerationApp, name)))
+                self.assertNotIn("maxsize", attributes)
+
+
+class PeriodicReportTests(unittest.TestCase):
+    """The periodic status report is cosmetic: it must never stop the overlay."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+
+    def setUp(self):
+        self.messages = []
+        self.original = self.module.diagnostics.write_now
+        self.module.diagnostics.write_now = lambda label, message: self.messages.append(
+            f"{label}: {message}")
+        self.addCleanup(setattr, self.module.diagnostics, "write_now", self.original)
+        self.app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        self.app.current_fps = 118.6
+        self.app.generated_fps = 118.6
+        self.app.live_fallback = False
+        self.app.frame_multiplier = 2
+        self.app.dropped_generated = 0
+        self.app.capture_fps = 61.4
+        self.app.display_queue = Queue(maxsize=5)
+        self.app.display_queue.put("frame")
+        self.app._queue_report = lambda size=None: "filas teste"
+
+    def test_nothing_is_written_before_the_interval(self):
+        self.assertEqual(self.app._log_periodic_status(1.0, 0.0), 0.0)
+        self.assertEqual(self.messages, [])
+
+    def test_the_timestamp_advances_when_it_reports(self):
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("FPS exibidos" in message for message in self.messages))
+
+    def test_a_broken_report_does_not_raise_and_keeps_the_schedule(self):
+        self.app._queue_report = lambda size=None: 1 / 0
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))
+
+
+
+    def test_the_report_includes_all_three_rates(self):
+        self.app._log_periodic_status(6.0, 0.0)
+        report = self.messages[0]
+        self.assertIn("FPS exibidos", report)
+        self.assertIn("gerados/s", report)
+        self.assertIn("captura 61.4/s", report)
+
+    def test_an_unmeasured_capture_rate_is_shown_as_unknown(self):
+        self.app.capture_fps = 0.0
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertIn("captura   ?", self.messages[0])
+
+    def test_the_log_says_where_the_frames_came_from(self):
+        self.app.live_fallback = True
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertTrue(any("live" in message for message in self.messages))
+
+    def test_the_report_reads_the_real_display_queue(self):
+        """The queue size is measured inside the report, not passed by the caller."""
+        self.app.__dict__.pop("_queue_report", None)      # use the real method
+        self.app.capture_queue = Queue(maxsize=2)
+        self.app.process_queue = Queue(maxsize=3)
+        self.app._log_periodic_status(6.0, 0.0)
+        self.assertTrue(any("exibição 1/5" in message for message in self.messages))
+
+    def test_a_broken_queue_is_reported_and_the_schedule_continues(self):
+        self.app.display_queue = object()          # no qsize() at all
+        self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
+        self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))
+
+
+if __name__ == "__main__":
+    unittest.main()

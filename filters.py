@@ -1,100 +1,106 @@
 import cv2
 import numpy as np
 import os
-import requests
+
+import diagnostics
+import ort_providers
+
 
 class AMDFilters:
+    """Sharpening and upscaling that stay cheap enough for real-time frames.
+
+    Everything here runs at the internal (processing) resolution: at display
+    resolution the same work costs 10-20x more per frame and starves the overlay.
+    """
+
+    # Beyond this amount the adaptive weight saturates to "sharpen everything",
+    # which is exactly the ringing CAS exists to avoid.
+    MAX_SHARPNESS = 2.0
+
+    @staticmethod
+    def _adaptive_weight(img, amount):
+        """Per-pixel sharpening weight: strong on flat detail, near zero on hard edges."""
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        detail = cv2.subtract(gray, cv2.blur(gray, (3, 3)), dtype=cv2.CV_16S)
+        # Flat areas (detail 0) keep the full amount; high-contrast edges keep almost none.
+        return cv2.convertScaleAbs(detail, alpha=-float(amount), beta=float(amount) * 255.0)
+
     @staticmethod
     def apply_cas(img, sharpness=0.5):
+        """Contrast adaptive sharpening with 8-bit saturating maths only.
+
+        The previous float32 erode/dilate/filter2D version cost ~95 ms per 1080p
+        frame; this one is a couple of milliseconds at the internal resolution.
         """
-        Improved AMD FidelityFX Contrast Adaptive Sharpening (CAS).
-        Optimized implementation that uses local min/max for adaptive weighting.
-        """
-        if sharpness <= 0: return img
-        
-        img_f = img.astype(np.float32) / 255.0
-        
-        # We need to process each channel or luminance
-        # Simplified but effective adaptive weighting
-        
-        # 3x3 local min/max (approx by erosions/dilations)
-        kernel = np.ones((3,3), np.uint8)
-        local_min = cv2.erode(img_f, kernel)
-        local_max = cv2.dilate(img_f, kernel)
-        
-        # AMD CAS Weight logic: 
-        # weight = sqrt(min(l, 1-max) / max) * sharpness
-        # We'll use a fast version:
-        # Avoid division by zero
-        local_max = np.maximum(local_max, 1e-5)
-        
-        # Calculate adaptive weight per pixel
-        # This weight is lower in high-contrast (edges) to prevent halos
-        w = np.sqrt(np.minimum(local_min, 1.0 - local_max) / local_max) * (sharpness * 0.5)
-        
-        # Standard sharpening kernel based on the weight
-        # [ 0 -w  0 ]
-        # [-w 1+4w -w]
-        # [ 0 -w  0 ]
-        
-        sharp_kernel = np.array([
-            [0, -1, 0],
-            [-1, 4, -1],
-            [0, -1, 0]
-        ], dtype=np.float32)
-        
-        details = cv2.filter2D(img_f, -1, sharp_kernel)
-        
-        # Apply the adaptive weight to the high-frequency details
-        # Broadcast w (H,W,C) if needed, but erode/dilate handles channels
-        result = img_f + details * w
-        
-        return (np.clip(result, 0, 1) * 255).astype(np.uint8)
+        try:
+            amount = min(max(float(sharpness), 0.0), AMDFilters.MAX_SHARPNESS)
+        except (TypeError, ValueError):
+            return img
+        if amount <= 0:
+            return img
+
+        weight = AMDFilters._adaptive_weight(img, amount)
+        weight_rgb = cv2.cvtColor(weight, cv2.COLOR_GRAY2RGB)
+        blurred = cv2.blur(img, (3, 3))
+        # Positive and negative detail are handled separately so every operation
+        # can stay in uint8 and clamp instead of wrapping around.
+        brighter = cv2.subtract(img, blurred)
+        darker = cv2.subtract(blurred, img)
+        sharpened = cv2.add(img, cv2.multiply(brighter, weight_rgb, scale=1.0 / 255.0))
+        return cv2.subtract(sharpened, cv2.multiply(darker, weight_rgb, scale=1.0 / 255.0))
+
+    @staticmethod
+    def apply_unsharp(img, sharpness=0.3, sigma=2.0):
+        """Plain unsharp mask, used when FSR is off."""
+        try:
+            amount = min(max(float(sharpness), 0.0), AMDFilters.MAX_SHARPNESS)
+        except (TypeError, ValueError):
+            return img
+        if amount <= 0:
+            return img
+        return cv2.addWeighted(img, 1.0 + amount, cv2.GaussianBlur(img, (0, 0), sigma), -amount, 0)
 
     @staticmethod
     def apply_easu(img, target_dim):
+        """Upscale step of the FSR path.
+
+        Bicubic is visually close to Lanczos on an already sharpened image and
+        several times cheaper, which is what keeps the overlay at the target FPS.
         """
-        Simplified Edge-Adaptive Spatial Upsampling (EASU).
-        Uses Lanczos4 with a pre-pass edge boost.
-        """
-        h, w = img.shape[:2]
-        if (w, h) == target_dim: return img
-        
-        # Pass 1: High-quality Lanczos upscale
-        upscaled = cv2.resize(img, target_dim, interpolation=cv2.INTER_LANCZOS4)
-        
-        # Pass 2: Light CAS to restore edge definition lost in scaling
-        return AMDFilters.apply_cas(upscaled, sharpness=0.3)
+        height, width = img.shape[:2]
+        if (width, height) == tuple(target_dim):
+            return img
+        return cv2.resize(img, target_dim, interpolation=cv2.INTER_CUBIC)
 
 class NvidiaAIUpscaler:
     def __init__(self, model_path=None):
         self.model_path = model_path or os.path.join(os.path.dirname(__file__), "models", "fsrcnn_x2.onnx")
         self.session = None
-        self._download_model_if_missing()
-        self._init_session()
+        if self._check_model_file():
+            self._init_session()
 
-    def _download_model_if_missing(self):
-        if not os.path.exists(self.model_path):
-            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-            print(f"Downloading AI model to {self.model_path}...")
-            # Using a public lightweight FSRCNN ONNX model
-            url = "https://github.com/onuralpszener/FSRCNN-PyTorch/raw/master/fsrcnn_x2.onnx"
-            try:
-                r = requests.get(url, allow_redirects=True)
-                with open(self.model_path, 'wb') as f:
-                    f.write(r.content)
-                print("Model downloaded successfully.")
-            except Exception as e:
-                print(f"Failed to download model: {e}")
+    def _check_model_file(self):
+        """The model ships with the app; a missing file is a real problem to report."""
+        if os.path.exists(self.model_path):
+            return True
+        message = f"modelo de upscale ausente: {self.model_path}"
+        print(f"AI SuperRes disabled: {message}")
+        diagnostics.write_now("ia", message)
+        return False
 
     def _init_session(self):
         try:
-            import onnxruntime as ort
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            print(f"Inference session initialized with {self.session.get_providers()}")
+            # DirectML first: the same model runs in a few milliseconds on a GPU and
+            # in hundreds of milliseconds on the CPU, which is the difference between
+            # a filter that fits the frame budget and one that stalls the overlay.
+            self.session, providers = ort_providers.create_session(self.model_path)
+            used = ort_providers.describe(self.session)
+            print(f"AI upscaler session initialized with {used}")
+            diagnostics.write_now("ia", f"upscaler ONNX em {used}")
         except Exception as e:
+            self.session = None
             print(f"Error initializing ONNX session: {e}")
+            diagnostics.write_now("ia", f"erro ao carregar o modelo de upscale: {e}")
 
     def upscale(self, img):
         if self.session is None: return img

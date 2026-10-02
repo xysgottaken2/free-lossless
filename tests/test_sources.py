@@ -2,11 +2,15 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import i18n
 from helpers import load_module, stubs
 
 
 class SourceTests(unittest.TestCase):
     def setUp(self):
+        # These tests describe the Portuguese (Brazil) build; the catalog is checked below.
+        i18n.set_language("pt-BR")
+        self.addCleanup(i18n.set_language, "en")
         self.deps = stubs("win32gui", "win32process", "psutil", "win32api")
         self.module = load_module("selector", self.deps)
         self.patch = patch.dict(sys.modules, self.deps)
@@ -26,6 +30,15 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(displays[0]["title"], "Display 1")
         self.assertEqual(displays[1]["title"], "Display 2 (Monitor principal)")
         self.assertEqual(displays[0]["rect"], (-1920, -200, 0, 880))
+
+    def test_display_titles_follow_the_selected_language(self):
+        self.assertEqual(self.module.DisplaySelector.get_displays()[1]["title"],
+                         "Display 2 (Monitor principal)")
+        i18n.set_language("en")
+        self.assertEqual(self.module.DisplaySelector.get_displays()[0]["title"], "Display 1")
+        i18n.set_language("zh-CN")
+        self.assertEqual(self.module.DisplaySelector.get_displays()[1]["title"], "显示器 2（主显示器）")
+        i18n.set_language("pt-BR")
 
     def test_display_source_does_not_require_hwnd(self):
         source = {"source_type": "display", "device": r"\\.\DISPLAY1"}

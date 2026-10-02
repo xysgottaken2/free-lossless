@@ -5,6 +5,16 @@ from unittest.mock import MagicMock, patch
 
 from helpers import load_module, stubs
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - the CI image installs numpy
+    np = None
+
+try:
+    import cv2 as real_cv2
+except ImportError:  # pragma: no cover - the CI image installs OpenCV
+    real_cv2 = None
+
 
 def output(device, rect):
     return SimpleNamespace(devicename=device, desc=SimpleNamespace(
@@ -88,3 +98,60 @@ class CaptureTests(unittest.TestCase):
         cap.capture_frame()
         self.dxcam.create.assert_called_with(device_idx=0, output_idx=0, output_color="RGB")
         self.dxcam.create.return_value.grab.assert_called_with(region=(10, 20, 510, 520))
+
+
+class BitBltPixelFormatTests(unittest.TestCase):
+    """The BitBlt path must hand BGRA buffers to OpenCV instead of slicing them."""
+
+    def setUp(self):
+        self.deps = stubs("dxcam", "win32gui", "win32api", "win32ui", "win32con", "cv2")
+        self.module = load_module("capture", self.deps)
+        self.patch = patch.dict(sys.modules, self.deps)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.module.np = np
+        self.cap = self.module.ScreenCapture.__new__(self.module.ScreenCapture)
+        self.cap.mode = "bitblt"
+        self.cap.region = (0, 0, 2, 2)
+        self.cap._last_dims = (2, 2)
+        self.cap._save_dc = MagicMock()
+        self.cap._save_bitmap = MagicMock()
+        self.cap._mfc_dc = MagicMock()
+        self.cap._hwnd_dc = MagicMock()
+        # Four BGRA pixels (a 2x2 frame).
+        self.cap._save_bitmap.GetBitmapBits.return_value = bytes([
+            10, 20, 30, 255, 40, 50, 60, 255,
+            70, 80, 90, 255, 100, 110, 120, 255,
+        ])
+        self.cv2 = self.deps["cv2"]
+        self.cv2.cvtColor.return_value = "rgb-frame"
+
+    def test_bitblt_hands_the_buffer_to_cvtcolor_once(self):
+        self.assertEqual(self.cap._capture_bitblt(), "rgb-frame")
+        self.cv2.cvtColor.assert_called_once()
+        frame, conversion = self.cv2.cvtColor.call_args.args
+        self.assertEqual(conversion, self.cv2.COLOR_BGRA2RGB)
+        self.assertEqual(frame.shape, (2, 2, 4))
+        self.assertEqual(frame.dtype, np.uint8)
+
+    def test_bitblt_keeps_using_the_cached_gdi_resources(self):
+        self.cap._capture_bitblt()
+        self.cap._capture_bitblt()
+        self.assertEqual(self.cap._save_bitmap.GetBitmapBits.call_count, 2)
+        self.deps["win32ui"].CreateCompatibleDC.assert_not_called()
+
+
+@unittest.skipIf(real_cv2 is None or np is None, "OpenCV is not installed")
+class RealConversionTests(unittest.TestCase):
+    def test_cvtcolor_matches_the_manual_channel_reversal(self):
+        """Same pixels as the old slicing, without the ~11 ms per 1080p frame."""
+        rng = np.random.default_rng(3)
+        bgra = rng.integers(0, 256, (32, 32, 4), dtype=np.uint8)
+        expected = bgra[:, :, :3][:, :, ::-1]
+        converted = real_cv2.cvtColor(bgra, real_cv2.COLOR_BGRA2RGB)
+        self.assertTrue(np.array_equal(converted, expected))
+        self.assertTrue(converted.flags["C_CONTIGUOUS"])
+
+
+if __name__ == "__main__":
+    unittest.main()

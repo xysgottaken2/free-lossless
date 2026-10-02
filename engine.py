@@ -4,6 +4,10 @@ import time
 import os
 import requests
 
+import diagnostics
+import ort_providers
+
+
 class RIFEEngine:
     def __init__(self, model_version="rife-v4"):
         """
@@ -37,12 +41,16 @@ class RIFEEngine:
             self.dis.setVariationalRefinementIterations(0)
             print("Engine set to STANDARD Precision")
 
-    def interpolate(self, frame1, frame2):
+    def interpolate(self, frame1, frame2, timestep=0.5):
         """
         Interpolate between frame1 and frame2 using stabilized bilateral warping.
+
+        ``timestep`` positions the result between both frames (0 = frame1, 1 = frame2),
+        which allows generating several intermediate frames per captured pair.
         """
         if frame1.shape != frame2.shape:
             return frame2
+        timestep = min(1.0, max(0.0, float(timestep)))
 
         h, w = frame1.shape[:2]
         
@@ -83,10 +91,15 @@ class RIFEEngine:
         protection_mask = np.maximum(static_mask, edge_mask)
         protection_mask = cv2.dilate(protection_mask, np.ones((3, 3), np.uint8))
         protection_mask = cv2.GaussianBlur(protection_mask, (5, 5), 0)
-        
+
+        # Motion magnitude, also at the small scale: 16x cheaper than at full
+        # resolution and the mask is smoothed anyway.
+        small_mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        # 0 = pure warp, 0.4 = mix with a cross-fade where motion is extreme.
+        small_blend = np.clip(small_mag / 30.0, 0.0, 1.0) * 0.4
+
         # Dampen flow: 0 flow in protected areas
-        flow[..., 0] *= (1.0 - protection_mask)
-        flow[..., 1] *= (1.0 - protection_mask)
+        flow *= (1.0 - protection_mask)[..., np.newaxis]
 
         # 6. Scale and resize flow
         flow = flow * (1.0 / scale)
@@ -99,38 +112,33 @@ class RIFEEngine:
             self.map_y = self.map_y.astype(np.float32)
             self.last_h, self.last_w = h, w
         
-        # Motion magnitude for adaptive blending
-        mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+        # Forward warp map (frame1 -> intermediate frame)
+        m1_x = self.map_x + flow[..., 0] * timestep
+        m1_y = self.map_y + flow[..., 1] * timestep
         
-        # Forward warp map (frame1 -> mid)
-        m1_x = self.map_x + flow[..., 0] * 0.5
-        m1_y = self.map_y + flow[..., 1] * 0.5
-        
-        # Backward warp map (frame2 -> mid)
-        m2_x = self.map_x - flow[..., 0] * 0.5
-        m2_y = self.map_y - flow[..., 1] * 0.5
+        # Backward warp map (frame2 -> intermediate frame)
+        m2_x = self.map_x - flow[..., 0] * (1.0 - timestep)
+        m2_y = self.map_y - flow[..., 1] * (1.0 - timestep)
         
         # Warp both
         inter1 = cv2.remap(frame1, m1_x, m1_y, cv2.INTER_LINEAR)
         inter2 = cv2.remap(frame2, m2_x, m2_y, cv2.INTER_LINEAR)
         
-        # Adaptive Blending: favor cross-fade in extreme motion or flow noise
-        # mag_mask identifies areas with very high displacement
-        blend_mask = np.clip(mag / 30.0, 0, 1.0)
+        # Weighted combination: in low motion the warped frames win; in extreme
+        # motion the mask mixes in a cross-fade to hide artifacts.
+        combined = cv2.addWeighted(inter1, 1.0 - timestep, inter2, timestep, 0)
         
-        # Weighted combination: 
-        # In low motion, use full warping. 
-        # In high motion, mix with cross-fade to hide artifacts.
-        combined = cv2.addWeighted(inter1, 0.5, inter2, 0.5, 0)
-        
-        if np.max(blend_mask) > 0.05:
-            cross_fade = cv2.addWeighted(frame1, 0.5, frame2, 0.5, 0)
-            mask_3c = cv2.merge([blend_mask, blend_mask, blend_mask])
-            # Factor 0.4 ensures we still see some motion even in high-speed areas
-            final = combined * (1.0 - mask_3c * 0.4) + cross_fade * (mask_3c * 0.4)
-            return final.astype(np.uint8)
-        
-        return combined
+        # Everything below stays in uint8: the float32 version allocated several
+        # full-resolution temporaries and cost more than the flow itself.
+        blend_mask = cv2.resize(small_blend, (w, h), interpolation=cv2.INTER_LINEAR)
+        weight = cv2.convertScaleAbs(blend_mask, alpha=255.0)
+        if cv2.countNonZero(weight) == 0:
+            return combined
+        weight_rgb = cv2.cvtColor(weight, cv2.COLOR_GRAY2RGB)
+        cross_fade = cv2.addWeighted(frame1, 1.0 - timestep, frame2, timestep, 0)
+        inverse = cv2.bitwise_not(weight_rgb)  # 255 - weight, in place of a subtraction
+        return cv2.add(cv2.multiply(combined, inverse, scale=1.0 / 255.0),
+                       cv2.multiply(cross_fade, weight_rgb, scale=1.0 / 255.0))
 
 
 class RIFEONNXEngine:
@@ -168,31 +176,26 @@ class RIFEONNXEngine:
     def _init_session(self):
         try:
             import onnxruntime as ort
-            # We prefer DirectML for Windows GPUs (all vendors), then CUDA, then CPU
-            providers = [
-                'DmlExecutionProvider', 
-                'CUDAExecutionProvider', 
-                'CPUExecutionProvider'
-            ]
-            
-            # Optimization: Enable optimizations and fixed shape if possible
+            # DirectML (every Windows GPU), then CUDA, then the CPU.
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            
-            self.session = ort.InferenceSession(self.model_path, sess_options=sess_options, providers=providers)
-            
-            used_providers = self.session.get_providers()
-            print(f"RIFE Inference session initialized with: {used_providers}")
-            
-            if 'DmlExecutionProvider' not in used_providers and 'CUDAExecutionProvider' not in used_providers:
+            self.session, providers = ort_providers.create_session(self.model_path, sess_options)
+            used = ort_providers.describe(self.session)
+            print(f"RIFE Inference session initialized with: {used}")
+            diagnostics.write_now("motor", f"RIFE ONNX em {used}")
+            if not ort_providers.is_gpu(providers):
                 print("WARNING: RIFE is running on CPU. Performance will be low.")
                 print("HINT: Install 'onnxruntime-directml' for GPU acceleration on Windows.")
+                diagnostics.write_now("motor", "RIFE rodando na CPU (sem DirectML/CUDA)")
         except Exception as e:
             print(f"Error initializing RIFE ONNX session: {e}")
+            diagnostics.write_now("motor", f"erro ao iniciar o RIFE: {e}")
 
-    def interpolate(self, frame1, frame2):
+    def interpolate(self, frame1, frame2, timestep=0.5):
         if self.session is None:
             return frame2
+        timestep = min(1.0, max(0.0, float(timestep)))
+        time_array = np.array([timestep], dtype=np.float32)
             
         h, w = frame1.shape[:2]
         
@@ -210,7 +213,7 @@ class RIFEONNXEngine:
         input_dict = {
             "img0": img1,
             "img1": img2,
-            "timestep": np.array([0.5], dtype=np.float32)
+            "timestep": time_array
         }
         
         try:
@@ -220,7 +223,7 @@ class RIFEONNXEngine:
             # Post-process: (1, C, H, W) -> (H, W, C) [0, 255]
             res = (np.clip(output[0].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
             return res
-        except Exception as e:
+        except Exception:
             # Fallback if names are slightly different or model varies
             try:
                 # Dynamic mapping if names changed
@@ -230,7 +233,7 @@ class RIFEONNXEngine:
                     inputs[1]: img2
                 }
                 if len(inputs) > 2:
-                    alt_dict[inputs[2]] = np.array([0.5], dtype=np.float32)
+                    alt_dict[inputs[2]] = time_array
                 output = self.session.run(None, alt_dict)[0]
                 res = (np.clip(output[0].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
                 return res
@@ -249,8 +252,9 @@ if __name__ == "__main__":
     cv2.circle(f2, (200, 100), 50, (255, 0, 0), -1)
     
     print("Testing interpolation...")
-    start = time.time()
-    result = engine.interpolate(f1, f2)
-    end = time.time()
-    print(f"Interpolation took: {end - start:.4f} seconds ({1/(end-start):.2f} FPS)")
-    cv2.imwrite("test_inter.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+    for step in (0.25, 0.5, 0.75):
+        start = time.time()
+        result = engine.interpolate(f1, f2, timestep=step)
+        end = time.time()
+        print(f"t={step}: {end - start:.4f} seconds ({1/(end-start):.2f} FPS)")
+        cv2.imwrite(f"test_inter_{int(step * 100)}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR))

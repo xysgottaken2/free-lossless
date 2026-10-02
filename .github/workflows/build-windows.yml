@@ -32,18 +32,77 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip check
 
-      - name: Check syntax and run tests
+      - name: Check the ONNX runtime has a GPU provider
+        shell: bash
         run: |
-          python -m compileall -q main.py ui.py selector.py capture.py engine.py filters.py build_app.py
-          python -m unittest discover -s tests -v
+          python -c "import onnxruntime; p = onnxruntime.get_available_providers(); print('providers:', p); assert 'DmlExecutionProvider' in p, 'onnxruntime sem DirectML: os motores de IA rodariam na CPU'"
 
-      - name: Build executable
-        run: python build_app.py
+      - name: Check syntax and run tests
+        shell: bash
+        env:
+          # Tests exercise every module; they must not write to a real overlay.log.
+          FREE_LOSSLESS_LOG: '0'
+        run: |
+          python -m compileall -q main.py ui.py settings.py selector.py capture.py engine.py filters.py effects.py d3d_display.py reshade.py i18n.py theme.py splash.py diagnostics.py ort_providers.py build_app.py
+          if python -m unittest discover -s tests -v > unittest.log 2>&1; then
+            cat unittest.log
+          else
+            status=$?
+            cat unittest.log
+            # Also publish the failure text as annotations, which stay readable
+            # from tooling that cannot download raw job logs.
+            python tests/report_failures.py unittest.log "$status"
+            exit $status
+          fi
 
-      - name: Upload executable
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unittest-log
+          path: unittest.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Build single-file executable
+        run: |
+          python build_app.py onefile
+          mkdir -p release/single-file
+          cp dist/FreeLossless.exe release/single-file/
+
+      - name: Build portable folder (opens much faster)
+        run: |
+          python build_app.py onedir
+          mkdir -p release/portable
+          cp -r dist/FreeLossless/. release/portable/
+
+      - name: Upload single-file executable
         uses: actions/upload-artifact@v4
         with:
           name: FreeLossless-Windows-x64
-          path: dist/FreeLossless.exe
+          path: release/single-file/FreeLossless.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload portable folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeLossless-Windows-x64-portable
+          path: release/portable
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Show what was built
+        shell: bash
+        run: |
+          echo "single file:" && ls -la release/single-file
+          echo "portable:" && du -sh release/portable && ls release/portable | head -20
+          echo "raiz do pacote:" && ls release/portable | head -25
+          echo "DLLs do SDL:" && find release/portable -iname "SDL2*.dll" | head -5
+          echo "bindings _sdl2:" && find release/portable -path "*_sdl2*" \( -name "*.pyd" -o -name "*.dll" \) | head -5
+          # O modo D3D11 (ReShade) depende destes arquivos dentro do pacote.
+          find release/portable -iname "SDL2*.dll" | grep -q . \
+            || { echo "::error::SDL2.dll fora do pacote: o overlay nao abriria"; exit 1; }
+          find release/portable -path "*_sdl2*" \( -name "*.pyd" -o -name "*.dll" \) | grep -q . \
+            || { echo "::error::bindings _sdl2 fora do pacote: o modo D3D11 (ReShade) nao funcionaria no .exe"; exit 1; }
+          echo "pacote verificado: SDL2 e _sdl2 presentes"

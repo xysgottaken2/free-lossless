@@ -2,6 +2,8 @@ import win32gui
 import win32process
 import psutil
 
+import i18n
+
 class WindowSelector:
     @staticmethod
     def get_visible_windows():
@@ -52,7 +54,8 @@ class DisplaySelector:
                 "source_type": "display",
                 "device": device,
                 "number": number,
-                "title": f"Display {number}" + (" (Monitor principal)" if primary else ""),
+                "title": i18n.translate("selector.primary_monitor" if primary else "selector.display",
+                                        number=number),
                 "primary": primary,
                 "rect": tuple(info["Monitor"]),
             })
@@ -63,7 +66,7 @@ class DisplaySelector:
         for display in DisplaySelector.get_displays():
             if display["device"] == device:
                 return display["rect"]
-        raise ValueError("O monitor selecionado foi desconectado. Atualize a lista.")
+        raise ValueError(i18n.translate("msg.display_disconnected"))
 
 
 def get_source_rect(source):
