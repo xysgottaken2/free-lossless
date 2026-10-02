@@ -135,6 +135,8 @@ class FilterToggleTests(unittest.TestCase):
 
     def test_the_image_chain_runs_when_the_filters_are_on(self):
         self.app.filters_enabled = True
+        # The upscaler returns a real frame (a double-sized one, like the model does).
+        self.app.ai_upscaler.upscale.return_value = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.app._render_for_display(self.frame())
         self.app.ai_upscaler.upscale.assert_called_once()
 

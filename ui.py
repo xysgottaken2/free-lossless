@@ -9,6 +9,7 @@ import reshade
 from selector import WindowSelector, DisplaySelector
 from settings import (
     ALGORITHM_OPTIONS, CAPTURE_MODES, DEFAULT_SETTINGS, DISPLAY_MODES, ENGINE_OPTIONS, FILTER_PRESETS,
+    INTERNAL_RESOLUTIONS,
     HOTKEY_OPTIONS, HOTKEY_SETTING_KEYS, MULTIPLIER_MAX,
     MULTIPLIER_MIN, MULTIPLIER_STEP, SCALE_OPTIONS, SettingsStore,
     hotkey_conflicts, normalize_settings, source_identity,
@@ -30,6 +31,13 @@ ALGORITHM_HINT_KEYS = {
     "NVIDIA AI SuperRes": "algo.hint.ai",
 }
 DISPLAY_MODE_LABEL_KEYS = {"GDI": "display.gdi", "D3D11": "display.d3d11"}
+INTERNAL_RESOLUTION_LABEL_KEYS = {
+    "Auto": "internal.auto",
+    "Performance": "internal.performance",
+    "HD": "internal.hd",
+    "Full HD": "internal.fullhd",
+    "Native": "internal.native",
+}
 FILTER_LABEL_KEYS = {
     "Off": "filter.off",
     "Soft": "filter.soft",
@@ -58,6 +66,7 @@ class GameSelectorUI:
         "scale": "scale_var", "algo": "algo_var", "sharpness": "sharp_var",
         "fg_enabled": "fg_var", "filters_enabled": "filters_var", "engine_type": "engine_var",
         "filter_preset": "filter_var", "display_mode": "display_mode_var",
+        "internal_resolution": "internal_res_var",
         "ultra_smooth": "ultra_smooth_var", "performance_mode": "perf_mode_var",
         "low_latency": "low_latency_var", "frame_multiplier": "multiplier_var",
         "show_fps": "show_fps_var", "hotkey_stop": "hotkey_stop_var",
@@ -446,6 +455,14 @@ class GameSelectorUI:
         self._label(sharp_line, textvariable=self.sharp_value_var, bold=True).grid(row=0, column=1, sticky="e")
         self.sharp_scale = self._slider(image, self.sharp_var, 0, 100)
         self.sharp_scale.grid(row=7, column=0, sticky="ew", pady=(6, 8))
+        self._label(image, _t("field.internal_resolution"), size=9).grid(row=8, column=0, sticky="w",
+                                                                        pady=(0, 6))
+        resolution_labels = {value: _t(INTERNAL_RESOLUTION_LABEL_KEYS[value])
+                             for value in INTERNAL_RESOLUTIONS}
+        self.internal_res_combo = self._linked_combo(image, self.internal_res_var, resolution_labels)
+        self.internal_res_combo.grid(row=9, column=0, sticky="ew")
+        self._label(image, _t("internal.hint"), muted=True, size=9,
+                    justify=tk.LEFT).grid(row=10, column=0, sticky="w", pady=(4, 0))
 
         reshade_section = self._section(parent, _t("section.reshade"), 2)
         self._label(reshade_section, _t("field.display_mode"), size=9).grid(row=1, column=0, sticky="w",
@@ -881,6 +898,7 @@ class GameSelectorUI:
         self.filters_hint_var.set("" if filters_on else _t("filters.disabled"))
         self.filters_hint_label.config(fg=COLORS["warning"])
         self.filter_combo.configure(state="readonly" if filters_on else "disabled")
+        self.internal_res_combo.configure(state="readonly" if filters_on else "disabled")
         self.algo_hint_var.set(_t(ALGORITHM_HINT_KEYS.get(self.algo_var.get(), "algo.hint.bicubic")))
         self.filter_hint_var.set(_t("filter.hint"))
         if not generation_on:

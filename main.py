@@ -133,6 +133,88 @@ def affordable_timesteps(timesteps, budget_ms, inference_ms):
     return sorted(picked)
 
 
+# Explicit internal resolutions offered in the menu. "Auto" is the default and
+# decides by algorithm (see internal_resolution_for).
+# Auto keeps the sharp target while the generator can hold the rate. The interpolator
+# costs time in proportion to the pixels it sees (measured on 2 cores: 18.6 ms at
+# 800x600, 48 ms at 720p, 83 ms at 1080p), so when the measured generation rate falls
+# below this fraction of what the requested multiplier needs, Auto steps the processing
+# resolution down — one step per window, at most down the ladder — instead of letting
+# the overlay judder. Explicit menu choices never adapt.
+AUTO_RESOLUTION_STEPS = (1.0, 0.7, 0.49, 0.34)
+AUTO_PROBE_SECONDS = 3.0
+AUTO_PROBE_MIN_RATIO = 0.75
+
+INTERNAL_RESOLUTION_TARGETS = {
+    "Performance": (800, 600),
+    "HD": (1280, 720),
+    "Full HD": (1920, 1080),
+}
+
+
+def internal_resolution_for(source_size, display_size, algorithm="", choice="Auto",
+                            performance_mode=False, auto_step=0):
+    """The resolution the whole pipeline works at.
+
+    Everything used to be capped at 800x600, so a 1080p overlay showed a 2.4x blow-up
+    of a small image — the "144p" look. These rules keep at most one resampling step
+    and none when the source already matches the display:
+
+    * Auto + neural upscale: half the display, because the model doubles the frame;
+    * Auto otherwise: the source size, capped at the display size;
+    * explicit choices (Performance/HD/Full HD/Native) always win, but are still
+      capped at the source: processing more pixels than the source has would be
+      upscaling done twice.
+    """
+    source_w, source_h = max(1, int(source_size[0])), max(1, int(source_size[1]))
+    display_w, display_h = max(1, int(display_size[0])), max(1, int(display_size[1]))
+    doubled_by_ai = False
+    if choice == "Native":
+        target = (source_w, source_h)
+    elif choice in INTERNAL_RESOLUTION_TARGETS:
+        target = INTERNAL_RESOLUTION_TARGETS[choice]
+    elif "AI" in str(algorithm):
+        doubled_by_ai = True
+        target = (max(2, display_w // 2), max(2, display_h // 2))
+    else:
+        target = (min(source_w, display_w), min(source_h, display_h))
+    if performance_mode and choice == "Auto":
+        target = (min(target[0], 1280), min(target[1], 720))
+    # Fit that target inside the source **keeping the source's shape**: clamping each
+    # axis on its own would squeeze one side of the image, and every filter after that
+    # would work on a distorted frame.
+    factor = min(1.0, target[0] / source_w, target[1] / source_h)
+    width, height = max(1, round(source_w * factor)), max(1, round(source_h * factor))
+    if choice == "Auto" and auto_step:
+        step_scale = auto_resolution_scale(auto_step)
+        if step_scale is not None:
+            width, height = max(1, round(width * step_scale)), max(1, round(height * step_scale))
+    if doubled_by_ai:
+        # Even sides keep the model's 2x output pixel aligned with the display.
+        width, height = max(2, width - width % 2), max(2, height - height % 2)
+    return width, height
+
+
+def auto_resolution_scale(step):
+    """Linear size factor for an Auto step; None when the ladder has no step left."""
+    if step < 0:
+        return AUTO_RESOLUTION_STEPS[0]
+    if step >= len(AUTO_RESOLUTION_STEPS):
+        return None
+    return AUTO_RESOLUTION_STEPS[step]
+
+
+def internal_resolution_reason(choice, algorithm):
+    """Why that resolution was picked, for the log."""
+    if choice in INTERNAL_RESOLUTION_TARGETS or choice == "Native":
+        return "escolhida no menu"
+    if "AI" in str(algorithm):
+        return "metade da tela: o modelo de IA dobra o quadro"
+    if "FSR" in str(algorithm):
+        return "nativa da fonte: o EASU faz o upscale"
+    return "nativa da fonte: sem reamostragem"
+
+
 def queue_capacity(queue):
     """How many items a queue accepts.
 
@@ -250,7 +332,6 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
     to throw away.
     """
     from engine import RIFEEngine, RIFEONNXEngine
-    import cv2
 
     # Generation is best effort: it must never take CPU from the game or from the
     # overlay's display loop, which is the part the player actually looks at.
@@ -294,7 +375,6 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
                                        "Instale onnxruntime-directml ou use o motor Fast (DIS Flow).")
 
     fg_enabled = engine_config.get("fg_enabled", True)
-    internal_res = engine_config.get("internal_res", (800, 600))
     multiplier = max(1, int(engine_config.get("frame_multiplier", 2) or 2))
     requested = interpolation_timesteps(multiplier) if fg_enabled else []
     last_frame = None
@@ -322,11 +402,9 @@ def processing_subroutine(capture_queue, process_queue, engine_config, stop_even
                 arrival_ms = gap if arrival_ms <= 0 else arrival_ms * 0.8 + gap * 0.2
             last_capture_time = now
 
-            # Safety net: the capture worker already scales frames down.
-            h, w = current_frame.shape[:2]
-            if w > internal_res[0] or h > internal_res[1]:
-                current_frame = cv2.resize(current_frame, internal_res, interpolation=cv2.INTER_LINEAR)
-
+            # No resizing here: the capture worker is the single place that scales
+            # frames down, and a stale copy of the limit in this process would shrink
+            # frames back after the user resizes the source window.
             timesteps = affordable_timesteps(requested, arrival_ms * GENERATION_BUDGET_RATIO, inference_ms)
             if requested and last_frame is not None and not timesteps:
                 skipped += 1
@@ -410,7 +488,9 @@ class FrameGenerationApp:
         # Cost of rendering live frames, and the budget it must fit (half a frame).
         self.live_render_ms = 0.0
         self.live_render_budget_ms = 0.0
-        self.live_degraded = False
+        self.live_cost_logged = False
+        # Last image shown, reused for a brief hiccup instead of swapping to the capture.
+        self.last_shown_frame = None
         
         # Window & Performance management
         self.last_rect = None
@@ -423,6 +503,9 @@ class FrameGenerationApp:
         self.upscale_algo = cv2.INTER_LINEAR
         self.sharpness = 0.3
         self.internal_res = (800, 600) # Default target resolution for processing
+        self._auto_step = 0            # ladder position of the automatic resolution
+        self._auto_probe_start = time.perf_counter()
+        self._auto_probe_generated = 0
         self.display_dim = (1280, 720) # Actual output dimensions
         self.fsr_mode = False # Toggle for AMD CAS/EASU
         self.ai_mode = False # Toggle for NVIDIA AI SuperRes
@@ -503,45 +586,57 @@ class FrameGenerationApp:
 
 
     def _prepare_frame(self, frame):
-        """Downscale a captured frame to the processing resolution."""
+        """Downscale a captured frame to the processing resolution.
+
+        INTER_AREA averages the pixels it drops; INTER_LINEAR samples them, which turns
+        fine texture into noise — visibly so when the source is 1080p and the pipeline
+        works at 800x600 (measured: 37 dB against the correct downscale, versus 138 dB
+        with INTER_AREA).
+        """
         max_w, max_h = self.internal_res
         height, width = frame.shape[:2]
-        if width > max_w or height > max_h:
-            frame = cv2.resize(frame, (max_w, max_h), interpolation=cv2.INTER_LINEAR)
+        # Fit inside the target keeping the frame's shape: clamping the sides on their
+        # own would squeeze the picture (a 1920x1200 window on a 1920x1080 target).
+        scale = min(max_w / width, max_h / height)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
+                               interpolation=cv2.INTER_AREA)
         return frame
 
-    def _publish_live_frame(self, frame):
-        """Prepare a captured frame exactly like a generated one, for the fallback path.
+    def _fit_display(self, frame):
+        """Resize a frame to the display size, with the right filter for the direction."""
+        if (frame.shape[1], frame.shape[0]) == self.display_dim:
+            return frame
+        shrinking = frame.shape[1] > self.display_dim[0] or frame.shape[0] > self.display_dim[1]
+        interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+        return cv2.resize(frame, self.display_dim, interpolation=interpolation)
 
-        It goes through the same sharpening and upscale as a generated frame, so the
-        image does not change look when the two sources swap. If that rendering cannot
-        keep up with the capture rate, the cheap path (a plain resize) takes over for
-        the live frames: a slightly softer image at full frame rate beats a sharp one
-        that only updates a few times per second.
+    def _publish_live_frame(self, frame):
+        """Render a captured frame exactly like a generated one.
+
+        Same filters, same upscale: a live frame has to be indistinguishable from a
+        generated one, otherwise falling back to the capture shows up as flicker. An
+        earlier version switched to a cheap render when the cost went over budget —
+        and since the cost hovers around the budget, consecutive frames alternated
+        between sharp and soft, which is exactly what the eye picks up as flicker.
+        The cost is measured and written to the log instead.
         """
         started = time.perf_counter()
-        cheap = self.live_render_ms > self.live_render_budget_ms
         try:
-            display = self._cheap_render(frame) if cheap else self._render_for_display(frame)
+            display = self._render_for_display(frame)
         except Exception as exc:
             diagnostics.write_now("exibição", f"falha ao preparar frame ao vivo: {exc}")
             return
         spent = (time.perf_counter() - started) * 1000.0
         self.live_render_ms = (spent if self.live_render_ms <= 0
                                else self.live_render_ms * 0.8 + spent * 0.2)
-        if not self.live_degraded and self.live_render_ms > self.live_render_budget_ms:
-            self.live_degraded = True
-            diagnostics.write_now("exibição", f"renderização dos frames ao vivo custa "
-                                              f"{self.live_render_ms:.1f} ms (limite "
-                                              f"{self.live_render_budget_ms:.1f} ms): usando o "
-                                              f"caminho simples para manter o FPS")
+        if not self.live_cost_logged and self.live_render_ms > self.live_render_budget_ms:
+            self.live_cost_logged = True
+            diagnostics.write_now("exibição", f"frames ao vivo custam {self.live_render_ms:.1f} ms "
+                                              f"(meio intervalo de quadro é "
+                                              f"{self.live_render_budget_ms:.1f} ms): o modo LIVE "
+                                              f"entrega uma imagem por captura")
         put_latest(self.live_display_queue, display)
-
-    def _cheap_render(self, frame):
-        """Smallest possible path to the display: one resize, nothing else."""
-        if (frame.shape[1], frame.shape[0]) == self.display_dim:
-            return frame
-        return cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
 
     def _newest_live_frame(self):
         """Newest prepared capture; repeats the previous one instead of showing nothing."""
@@ -551,44 +646,34 @@ class FrameGenerationApp:
             except Empty:
                 return self.last_live_display
 
-    def _pick_frame(self, now, min_buffer, stall_timeout, return_delay):
-        """Show the newest frame available, from the generator or from the capture.
-
-        Both paths are prepared exactly the same way, so a change of source is not
-        visible in the image. What changes is the HUD chip, and that one only moves
-        after a sustained stall or a sustained recovery: flipping it frame by frame
-        is what made the panel look like it was flickering.
-        """
-        frame = None
-        from_generator = False
-        # Never display a backlog: if the generator produced more frames than the
-        # overlay showed, the oldest ones are already out of date.
+    def _take_generated_frame(self, min_buffer):
+        """Newest generated frame, dropping any backlog: late frames are stale."""
         while self.display_queue.qsize() > max(1, min_buffer):
             try:
                 self.display_queue.get_nowait()
                 self.dropped_generated += 1
             except Empty:
                 break
-        if self.display_queue.qsize() >= min_buffer or self.frame_count == 0:
-            try:
-                frame = self.display_queue.get_nowait()
-                from_generator = frame is not None
-            except Empty:
-                frame = None
-        if frame is None:
-            # Nothing generated is ready: the newest capture keeps the image moving.
-            frame = self._newest_live_frame()
+        if self.display_queue.qsize() < min_buffer:
+            return None
+        try:
+            return self.display_queue.get_nowait()
+        except Empty:
+            return None
 
-        if from_generator:
+    def _pick_frame(self, now, min_buffer, stall_timeout, return_delay):
+        """Show the newest frame available, from the generator or from the capture.
+
+        The image source is sticky. It only changes to the capture after generation
+        has been behind for a whole stall window, and it only comes back after
+        generation has been healthy for a while. Before this, a single late frame
+        swapped the image for exactly one frame — interpolated, real, interpolated —
+        which the eye reads as flicker. A short hiccup now repeats the previous image
+        instead, and both paths are rendered the same way, so even a swap is subtle.
+        """
+        generated = self._take_generated_frame(min_buffer)
+        if generated is not None:
             self.starving_since = None
-            if self.live_fallback:
-                if self.healthy_since is None:
-                    self.healthy_since = now
-                elif now - self.healthy_since >= return_delay:
-                    self.live_fallback = False
-                    self.healthy_since = None
-                    print("Frame generation is keeping up again.")
-                    diagnostics.write_now("exibição", "geração voltou a acompanhar o ritmo (FG)")
         else:
             self.healthy_since = None
             if self.starving_since is None:
@@ -598,8 +683,31 @@ class FrameGenerationApp:
                 print("Frame generation cannot keep up: showing the live capture.")
                 diagnostics.write_now("exibição", "geração não acompanha o ritmo; "
                                                   "exibindo a captura direta (LIVE)")
+        if self.live_fallback and generated is not None:
+            if self.healthy_since is None:
+                self.healthy_since = now
+            elif now - self.healthy_since >= return_delay:
+                self.live_fallback = False
+                self.healthy_since = None
+                print("Frame generation is keeping up again.")
+                diagnostics.write_now("exibição", "geração voltou a acompanhar o ritmo (FG)")
 
         self.want_live_frames = self.live_fallback
+        from_generator = False
+        if self.live_fallback:
+            # Stay on the capture for the whole episode: alternating between the two
+            # sources frame by frame is the flicker being removed here.
+            frame = self._newest_live_frame()
+        elif generated is not None:
+            frame, from_generator = generated, True
+        elif self.frame_count == 0 or self.last_shown_frame is None:
+            # First frames: there is nothing to hold on to, use the capture.
+            frame = self._newest_live_frame()
+        else:
+            # A brief hiccup: repeat the last image instead of changing its look.
+            frame = self.last_shown_frame
+        if frame is not None:
+            self.last_shown_frame = frame
         self.last_frame_generated = from_generator
         return frame
 
@@ -639,6 +747,60 @@ class FrameGenerationApp:
         return (f"filas captura {self.capture_queue.qsize()}/{queue_capacity(self.capture_queue)}"
                 f" · pós {self.process_queue.qsize()}/{queue_capacity(self.process_queue)}"
                 f" · exibição {display_size}/{queue_capacity(self.display_queue)}")
+
+    def _set_internal_resolution(self, rect, auto_step=0):
+        """Pick the processing resolution for this source and display, and log it."""
+        source = (rect[2] - rect[0], rect[3] - rect[1])
+        choice = self.target_source.get("internal_resolution", "Auto")
+        algorithm = self.target_source.get("algo", "")
+        previous = getattr(self, "internal_res", None)
+        self.internal_res = internal_resolution_for(
+            source, self.display_dim, algorithm, choice,
+            bool(self.target_source.get("performance_mode")), auto_step)
+        self._auto_step = auto_step
+        self._auto_probe_start = time.perf_counter()
+        self._auto_probe_generated = 0
+        if self.internal_res != previous:
+            reason = internal_resolution_reason(choice, algorithm)
+            if auto_step and choice == "Auto":
+                reason = f"{reason}, degrau automático {auto_step} para manter o ritmo"
+            message = (f"resolução interna {self.internal_res[0]}x{self.internal_res[1]} de "
+                       f"{source[0]}x{source[1]} para {self.display_dim[0]}x{self.display_dim[1]} "
+                       f"({reason})")
+            print(f"[imagem] {message}")
+            diagnostics.write_now("imagem", message)
+        return self.internal_res
+
+    def _auto_adapt(self, now):
+        """Drop one Auto step when the generator cannot hold the requested rate.
+
+        Called once per measuring window. The rate it compares is the one the user
+        actually sees (generated frames that made it to the screen), so a machine that
+        cannot interpolate 1080p at 2x is corrected in the first seconds of the session
+        instead of juddering forever. An explicit menu choice is never overridden.
+        """
+        if self.target_source.get("internal_resolution", "Auto") != "Auto":
+            return False
+        if not getattr(self, "fg_enabled", True) or self.frame_multiplier <= 1:
+            return False
+        step = getattr(self, "_auto_step", 0)
+        if auto_resolution_scale(step + 1) is None:
+            return False
+        elapsed = now - getattr(self, "_auto_probe_start", now)
+        if elapsed < AUTO_PROBE_SECONDS:
+            return False
+        required = self.target_fps * (self.frame_multiplier - 1) / self.frame_multiplier
+        achieved = getattr(self, "_auto_probe_generated", 0) / elapsed
+        if achieved >= required * AUTO_PROBE_MIN_RATIO:
+            self._auto_probe_start = now     # healthy: watch the next window
+            self._auto_probe_generated = 0
+            return False
+        self._set_internal_resolution(self.capture.region, auto_step=step + 1)
+        diagnostics.write_now(
+            "imagem",
+            f"geração {achieved:.0f}/{required:.0f} quadros/s: resolução interna reduzida "
+            f"para {self.internal_res[0]}x{self.internal_res[1]} (Auto, degrau {step + 1})")
+        return True
 
     def _measure_filter_chain(self):
         """Log what the chosen filter preset costs per frame.
@@ -791,17 +953,14 @@ class FrameGenerationApp:
         """
         needs_upscale = (frame.shape[1], frame.shape[0]) != self.display_dim
         if not self.filters_enabled:
-            if needs_upscale:
-                frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
-            return frame
+            return self._fit_display(frame)
         # External (ReShade style) filters first, at the internal resolution: the same
         # work at display resolution costs several times more per frame.
         if self.filter_chain is not None and self.filter_chain.enabled:
             frame = self.filter_chain.apply(frame)
         if self.ai_mode and self.ai_upscaler:
             frame = self.ai_upscaler.upscale(frame)
-            if (frame.shape[1], frame.shape[0]) != self.display_dim:
-                frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
+            frame = self._fit_display(frame)
         elif self.fsr_mode:
             if self.sharpness > 0:
                 frame = AMDFilters.apply_cas(frame, self.sharpness)
@@ -927,19 +1086,14 @@ class FrameGenerationApp:
         self.process_queue = multiprocessing.Queue(maxsize=process_size)
         self.display_queue = Queue(maxsize=display_size)
 
-        # Performance tuning: Set internal resolution limit
-        # Performance Mode (Alta Res) uses 1280x720, Standard uses 800x600
-        max_w, max_h = (1280, 720) if self.target_source.get("performance_mode") else (800, 600)
-        
-        w, h = rect[2] - rect[0], rect[3] - rect[1]
-        if w > max_w: self.internal_res = (max_w, max_h)
-        else: self.internal_res = (w, h)
-        
         # Initial display dimensions
+        w, h = rect[2] - rect[0], rect[3] - rect[1]
         if self.scale_factor == -1:
             self.display_dim = (monitor_rect[2] - monitor_rect[0], monitor_rect[3] - monitor_rect[1])
         else:
             self.display_dim = (int(w * self.scale_factor), int(h * self.scale_factor))
+
+        self._set_internal_resolution(rect)
 
         print(f"Targeting: {self.target_source['title']} | Mode: {self.target_source['mode']} | FPS: {self.target_fps} | Scale: {scale_val} | Frame gen: x{multiplier}")
         print(f"Press {self.hotkey_names['stop']} to stop, {self.hotkey_names['fps']} to toggle FPS, "
@@ -1131,6 +1285,7 @@ class FrameGenerationApp:
                     generated_window = 0
                     fps_window_start = loop_now
                     diagnostics_time = self._log_periodic_status(loop_now, diagnostics_time)
+                    self._auto_adapt(loop_now)
 
                 # Precision pacing: sleep the bulk of the wait and spin only the
                 # last two milliseconds. Windows rounds short sleeps up to its timer
@@ -1169,10 +1324,6 @@ class FrameGenerationApp:
                         if self.last_rect != t_rect:
                             t_w, t_h = t_rect[2] - t_rect[0], t_rect[3] - t_rect[1]
                             
-                            # Update internal res cap immediately
-                            max_w, max_h = (1280, 720) if self.target_source.get("performance_mode") else (800, 600)
-                            if t_w > max_w: self.internal_res = (max_w, max_h)
-                            else: self.internal_res = (t_w, t_h)
 
                             overlay_rect = get_source_monitor_rect(self.target_source) if self.scale_factor == -1 else t_rect
                             if self.scale_factor == -1:
@@ -1187,13 +1338,14 @@ class FrameGenerationApp:
                                     screen = self.display_presenter.resize((d_w, d_h))
                                 else:
                                     screen = pygame.display.set_mode((d_w, d_h), pygame.NOFRAME)
+                            self._set_internal_resolution(t_rect)
                             self._apply_overlay_window_style(overlay_rect, (d_w, d_h))
                             self.last_rect = t_rect
                     except: pass
 
                     # A queued frame can still have the old size after a source resize.
                     if (frame.shape[1], frame.shape[0]) != self.display_dim:
-                        frame = cv2.resize(frame, self.display_dim, interpolation=cv2.INTER_LINEAR)
+                        frame = self._fit_display(frame)
                     if not frame.flags["C_CONTIGUOUS"]:
                         frame = np.ascontiguousarray(frame)
                     try:
@@ -1232,6 +1384,7 @@ class FrameGenerationApp:
                     fps_window_frames += 1
                     if self.last_frame_generated:
                         generated_window += 1
+                        self._auto_probe_generated += 1
                 else:
                     time.sleep(0.0005)
 

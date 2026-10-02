@@ -36,6 +36,7 @@ class DisplayFallbackTests(unittest.TestCase):
         self.app.last_frame_generated = False
         self.app.dropped_generated = 0
         self.app.frame_count = 1          # the first frame was already shown
+        self.app.last_shown_frame = None
         self.module.diagnostics.write = lambda message: None
         self.module.print = lambda *args, **kwargs: None
 
@@ -99,8 +100,12 @@ class ModeChipTests(DisplayFallbackTests):
         self.pick(0.6, stall=0.5)
         self.assertTrue(self.app.live_fallback)
         self.generated("generated")
-        self.assertIs(self.pick(0.7, stall=0.5, delay=0.5), "generated")
-        self.assertTrue(self.app.live_fallback)      # still LIVE, no flicker
+        # The chip stays on LIVE and so does the image: a single good frame in the
+        # middle of an episode must not change what is on screen, not even for one
+        # frame (that swap is what the user sees as flicker).
+        self.assertIs(self.pick(0.7, stall=0.5, delay=0.5), "live")
+        self.assertTrue(self.app.live_fallback)
+        self.assertFalse(self.app.last_frame_generated)
 
     def test_the_chip_returns_to_fg_after_the_generator_keeps_up(self):
         self.live("live")
@@ -131,15 +136,12 @@ class ModeChipTests(DisplayFallbackTests):
         self.assertEqual(changes, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class LiveRenderConsistencyTests(DisplayFallbackTests):
+    """Live frames are rendered exactly like generated ones.
 
-
-class LiveRenderBudgetTests(DisplayFallbackTests):
-    """Live frames keep coming even when rendering them costs too much.
-
-    The capture thread renders them itself, so an expensive render there would hold
-    every capture back and drop the frame rate the user sees.
+    An earlier version switched to a cheap render when the cost went over budget. The
+    cost hovers around that budget, so consecutive frames alternated between sharp and
+    soft — the flicker the user reported. The look is now fixed; the cost is logged.
     """
 
     def setUp(self):
@@ -154,39 +156,135 @@ class LiveRenderBudgetTests(DisplayFallbackTests):
         self.app.filter_chain = None
         self.app.live_render_ms = 0.0
         self.app.live_render_budget_ms = 4.0
-        self.app.live_degraded = False
+        self.app.live_cost_logged = False
         self.rendered = []
-        self.app._render_for_display = lambda frame: (self.rendered.append("full"), frame)[1]
+        self.app._render_for_display = self.expensive_render
+
+    def expensive_render(self, frame):
+        """Stands in for a render that costs far more than the frame budget."""
+        time.sleep(0.006)
+        self.rendered.append("full")
+        return frame
 
     def publish(self, frame="frame"):
         self.app._publish_live_frame(frame)
 
-    def test_a_cheap_render_is_used_while_it_fits_the_budget(self):
-        self.publish()
-        self.assertEqual(self.rendered, ["full"])
-
-    def test_rendering_is_downgraded_once_it_is_too_expensive(self):
-        self.publish()
-        for _ in range(40):                     # the smoothed cost climbs past the budget
-            self.app._render_for_display = lambda frame: (time.sleep(0.012), frame)[1]
+    def test_every_live_frame_uses_the_same_render(self):
+        for _ in range(30):
             self.publish()
-        self.assertTrue(self.app.live_degraded)
-        self.assertGreater(self.app.live_render_ms, self.app.live_render_budget_ms)
-        # It stops asking for the expensive render and only resizes.
-        self.app._render_for_display = lambda frame: (self.rendered.append("full"), frame)[1]
-        before = len(self.rendered)
+        self.assertEqual(len(self.rendered), 30)      # never degrades to a cheap path
+
+    def test_the_cost_keeps_being_measured(self):
         self.publish()
-        self.assertEqual(len(self.rendered), before)
+        self.assertGreater(self.app.live_render_ms, 0.0)
 
-    def test_the_cheap_path_only_resizes(self):
-        frame = np.zeros((600, 800, 3), dtype=np.uint8)
-        self.app._cheap_render(frame)
-        # One resize straight to the display size and nothing else.
-        self.assertEqual(self.deps["cv2"].resize.call_args.args[1], (1920, 1080))
+    def test_a_costly_render_is_written_to_the_log_once(self):
+        messages = []
+        original = self.module.diagnostics.write_now
+        self.module.diagnostics.write_now = lambda label, message: messages.append(message)
+        self.addCleanup(setattr, self.module.diagnostics, "write_now", original)
+        for _ in range(20):
+            self.publish()
+        complaints = [message for message in messages if "frames ao vivo custam" in message]
+        self.assertEqual(len(complaints), 1)
+        self.assertIn("LIVE", complaints[0])
 
-    def test_a_frame_already_at_display_size_is_passed_through(self):
+    def test_the_frame_reaches_the_display_queue_even_when_it_is_expensive(self):
+        self.publish("frame")
+        self.assertEqual(self.app._newest_live_frame(), "frame")
+
+    def test_display_sized_frames_are_not_resized_again(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1920, 1080)
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        self.assertIs(self.app._cheap_render(frame), frame)
+        self.assertIs(app._fit_display(frame), frame)
+
+    def test_downscaling_to_the_display_uses_area_averaging(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1280, 720)
+        app._fit_display(np.zeros((1080, 1920, 3), dtype=np.uint8))
+        self.assertIs(self.deps["cv2"].resize.call_args.kwargs["interpolation"],
+                      self.deps["cv2"].INTER_AREA)
+
+    def test_upscaling_to_the_display_stays_cheap(self):
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.display_dim = (1920, 1080)
+        app._fit_display(np.zeros((540, 960, 3), dtype=np.uint8))
+        self.assertIs(self.deps["cv2"].resize.call_args.kwargs["interpolation"],
+                      self.deps["cv2"].INTER_LINEAR)
+
+
+class StickySourceTests(DisplayFallbackTests):
+    """The image source only changes for a sustained reason.
+
+    A single late generated frame used to swap the image for exactly one frame
+    (interpolated, real, interpolated), which is visible as flicker.
+    """
+
+    def test_a_hickup_repeats_the_last_image_instead_of_swapping(self):
+        self.live("live")
+        self.generated("generated-0")
+        self.assertIs(self.pick(0.0), "generated-0")
+        # The generator misses one frame: the image stays the same for that frame.
+        self.assertIs(self.pick(0.01), "generated-0")
+        self.assertFalse(self.app.live_fallback)
+        self.assertFalse(self.app.last_frame_generated)
+
+    def test_a_stall_becomes_a_live_episode_after_the_window(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.assertIs(self.pick(0.0), "generated-0")
+        self.assertIs(self.pick(0.3), "generated-0")  # first miss: hold the image
+        self.assertIs(self.pick(0.6), "generated-0")  # still inside the window
+        self.assertFalse(self.app.live_fallback)
+        self.assertIs(self.pick(0.9), "live-0")       # window passed: LIVE episode
+        self.assertTrue(self.app.live_fallback)
+
+    def test_a_generated_frame_does_not_flip_the_image_mid_episode(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.6)                                # first miss (window starts)
+        self.assertIs(self.pick(1.0), "generated-0")  # 0.4 s: still holding
+        self.assertIs(self.pick(1.1), "live-0")       # 0.5 s: LIVE episode
+        self.assertTrue(self.app.live_fallback)
+        self.live("live-1")
+        self.generated("generated-1")
+        self.assertIs(self.pick(1.2), "live-1")       # stays on the capture
+        self.assertTrue(self.app.live_fallback)
+
+    def test_the_episode_ends_after_generation_is_healthy_for_a_while(self):
+        self.live("live-0")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.3)                                # first miss
+        self.assertIs(self.pick(0.8), "live-0")       # 0.5 s: now in LIVE
+        self.assertTrue(self.app.live_fallback)
+        self.generated("generated-1")
+        self.pick(0.9)                                # healthy window starts here
+        self.assertTrue(self.app.live_fallback)
+        self.live("live-1")
+        self.generated("generated-2")
+        self.assertIs(self.pick(1.2), "live-1")       # 0.3 s: still LIVE
+        self.assertTrue(self.app.live_fallback)
+        self.generated("generated-3")
+        self.assertIs(self.pick(1.5), "generated-3")  # 0.6 s: back to FG
+        self.assertFalse(self.app.live_fallback)
+
+    def test_the_hud_never_sees_a_generated_frame_that_was_not_shown(self):
+        """A repeated frame is not counted as a freshly generated one."""
+        self.live("live")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.01)
+        self.assertFalse(self.app.last_frame_generated)
+
+    def test_a_long_stall_is_not_reported_before_the_window(self):
+        self.live("live")
+        self.generated("generated-0")
+        self.pick(0.0)
+        self.pick(0.1)
+        self.assertFalse(self.app.live_fallback)
 
 
 class QueueReportTests(unittest.TestCase):
@@ -330,3 +428,7 @@ class PeriodicReportTests(unittest.TestCase):
         self.app.display_queue = object()          # no qsize() at all
         self.assertEqual(self.app._log_periodic_status(6.0, 0.0), 6.0)
         self.assertTrue(any("relatório periódico falhou" in message for message in self.messages))
+
+
+if __name__ == "__main__":
+    unittest.main()

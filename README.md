@@ -137,9 +137,8 @@ demorar mais que o normal).
 O gargalo do overlay era o pós-processamento na resolução cheia do monitor, a cada
 frame, além de cópias desnecessárias na captura:
 
-Medições na resolução interna (800 × 600; no modo de desempenho, 1280 × 720),
-numa máquina de teste modesta com 2 núcleos — em um PC comum os números são bem
-menores:
+Medições na resolução interna, numa máquina de teste modesta com 2 núcleos — em um PC
+comum os números são bem menores:
 
 | Etapa | Antes (1080p) | Agora (resolução interna) |
 | --- | --- | --- |
@@ -149,29 +148,62 @@ menores:
 | Conversão BGRA→RGB (BitBlt) | ~11 ms | ~0,3 ms (`cv2.cvtColor`) |
 | Upscale Lanczos | ~22 ms | bicúbico, ~2 ms |
 
+### Resolução interna
+
+A resolução em que a pipeline trabalha é escolhida em **Configurações → FILTROS →
+Resolução interna**, com **Auto** como padrão:
+
+| Escolha | O que faz |
+| --- | --- |
+| **Auto** (padrão) | Processa no tamanho da fonte, então um jogo em 1080p em tela cheia **não** é reduzido para depois ser ampliado — a imagem sai nítida, sem o aspecto de "144p". Com o upscale neural, usa metade da tela, porque o modelo dobra o quadro. |
+| **Desempenho (800 × 600)** / **HD (1280 × 720)** / **Full HD (1920 × 1080)** | Força um alvo fixo, sempre encaixado dentro do tamanho da fonte (nunca distorce e nunca amplia duas vezes). |
+| **Nativa** | Igual ao tamanho da fonte. |
+
+O alvo é sempre encaixado **preservando o formato** da fonte: um jogo 4:3 continua 4:3,
+mesmo que o alvo seja 16:9.
+
+O interpolador custa tempo em proporção aos pixels que vê. Medições nesta máquina de
+2 núcleos (motor rápido DIS):
+
+| Resolução processada | Custo por quadro gerado | Teto de geração |
+| --- | --- | --- |
+| 800 × 600 | ~19 ms | ~54 quadros/s |
+| 1280 × 720 | ~48 ms | ~21 quadros/s |
+| 1920 × 1080 | ~83 ms | ~12 quadros/s |
+
+Por isso o **Auto** também se adapta: se, numa janela de 3 segundos, a taxa de frames
+gerados que chega à tela fica abaixo de 75% do que o multiplicador pede (por exemplo,
+60/s num 2x a 120 FPS), ele desce um degrau (1,0 → 0,7 → 0,49 → 0,34 do alvo) e continua
+medindo. É uma decisão por janela, no começo da sessão, e o motivo vai para o log
+(`[imagem] geração 12/60 quadros/s: resolução interna reduzida para 1344x756`) — melhor
+uma imagem um pouco mais suave do que um overlay travado. Quem escolhe uma resolução no
+menu nunca sofre adaptação.
+
 Além disso:
 
-- A nitidez e o CAS acontecem **antes** do upscale, na resolução interna (800×600 ou
-  1280×720 no modo de desempenho). Fazer o mesmo trabalho na resolução da tela custa
-  10 a 20 vezes mais por frame.
+- A nitidez e o CAS acontecem **antes** do upscale, na resolução interna. Fazer o
+  mesmo trabalho na resolução da tela custa 10 a 20 vezes mais por frame.
 - As filas descartam o frame **mais antigo** quando enchem, em vez de travar a
   captura: o overlay mostra sempre o frame mais recente disponível.
 - A geração de frames é **adaptativa**: o worker só interpola o que cabe no intervalo
   entre duas capturas. Um motor mais lento que a captura deixa de enfileirar frames
   atrasados — melhor mostrar só os frames reais, sempre novos, do que um slideshow de
   frames interpolados velhos.
-- A imagem **nunca para**: quando não há frame gerado pronto, o overlay mostra a
-  captura mais recente já preparada (mesma nitidez e mesmo upscale), então a troca de
-  fonte não muda o visual do quadro.
-- As **imagens ao vivo** (modo LIVE) são renderizadas na thread de captura; se essa
-  renderização custar mais que meio intervalo de quadro, ela cai para o caminho simples
-  (um resize) — melhor uma imagem levemente mais suave em 120 FPS do que uma nítida a
-  30 FPS.
+- A imagem **nunca para**: quando não há frame gerado pronto, o overlay repete a última
+  imagem exibida. Um atraso curto (menos de meio segundo) não muda nada na tela; um
+  atraso longo entra em **LIVE** — e o overlay fica na captura pelo episódio inteiro, só
+  voltando para `FG` depois de meio segundo de frames gerados. Não existe mais a troca
+  de fonte a cada quadro, que era o flicker visível.
+- As **imagens ao vivo** (modo LIVE) passam pelo mesmo caminho de renderização dos
+  frames gerados: mesma nitidez, mesmo upscale, mesmo custo. Antes elas usavam um
+  caminho barato, e a diferença de nitidez entre `FG` e `LIVE` aparecia como cintilação
+  nos textos e nas bordas.
 - O worker de pós-processamento **espera na fila** em vez de fazer polling a cada 20 ms,
   e a captura dorme até o próximo quadro em vez de acordar a cada 1 ms.
 - O chip de status não pisca: ele só marca `LIVE` depois de um atraso contínuo de
-  meio segundo e só volta para `FG` depois de outro meio segundo de frames gerados. O
-  chip também mostra a taxa real de geração (por exemplo, `FG 118/s`).
+  meio segundo e só volta para `FG` depois de outro meio segundo de frames gerados — e
+  enquanto isso a imagem continua na captura, sem alternar. O chip também mostra a taxa
+  real de geração (por exemplo, `FG 118/s`).
 - O contador de FPS é medido de verdade, numa janela de meio segundo: se a pipeline
   não acompanhar, o número cai em vez de mentir.
 - O processo do overlay roda com prioridade alta; o worker de interpolação roda com

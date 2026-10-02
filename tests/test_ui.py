@@ -32,7 +32,8 @@ class SelectionUITests(unittest.TestCase):
                      "start_button", "selected_title_var", "selected_detail_var", "save_status_var", "save_dot",
                      "settings_store", "fps_value_var", "sharp_value_var", "engine_combo", "session_summary_var",
                      "algo_hint_var", "algo_combo", "sharp_scale", "filters_hint_var", "filters_hint_label",
-                     "filter_combo", "filter_hint_var", "reshade_hint_var", "reshade_hint_label"):
+                     "filter_combo", "filter_hint_var", "reshade_hint_var", "reshade_hint_label",
+                     "internal_res_combo"):
             setattr(self.ui, name, MagicMock())
         self.ui.tree.get_children.return_value = ["stale-window"]
         self.ui.tree.selection.return_value = []
@@ -238,6 +239,18 @@ class SelectionUITests(unittest.TestCase):
         self.assertFalse(self.ui._collect_settings()["filters_enabled"])
         self.ui.filters_var.value = True
         self.assertTrue(self.ui._collect_settings()["filters_enabled"])
+
+    def test_the_internal_resolution_is_saved_and_reloaded(self):
+        self.ui.internal_res_var.value = "HD"
+        self.assertEqual(self.ui._collect_settings()["internal_resolution"], "HD")
+        self.ui.internal_res_var.value = "Nada"
+        self.assertEqual(self.ui._collect_settings()["internal_resolution"], "Auto")
+
+    def test_the_internal_resolution_is_locked_when_the_filters_are_off(self):
+        self.ui.filters_var.value = False
+        self.ui._update_setting_display()
+        self.assertEqual(str(self.ui.internal_res_combo.configure.call_args.kwargs["state"]),
+                         "disabled")
 
     def test_the_filter_preset_is_saved_and_reloaded(self):
         self.ui.filter_var.value = "Sharp"

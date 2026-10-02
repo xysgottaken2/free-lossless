@@ -60,6 +60,16 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "Sharpest, but several times heavier than Bicubic on large screens.",
         "algo.hint.fsr": "Fast upscale with adaptive sharpening.",
         "algo.hint.ai": "Maximum quality through the neural model; requires a capable GPU.",
+        "field.internal_resolution": "Internal resolution",
+        "internal.auto": "Auto (recommended)",
+        "internal.performance": "Performance (800 × 600)",
+        "internal.hd": "HD (1280 × 720)",
+        "internal.fullhd": "Full HD (1920 × 1080)",
+        "internal.native": "Native (source size)",
+        "internal.hint": ("The resolution the filters work at, before the image goes to the screen. "
+                          "Auto processes at the source size, so a fullscreen game is not shrunk and "
+                          "blown up again; with the neural upscale it uses half the screen, because "
+                          "the model doubles the frame. Lower values cost less and look softer."),
         "section.reshade": "RESHADE (D3D11)",
         "field.display_mode": "How the overlay draws",
         "display.gdi": "GDI (compatible, recommended)",
@@ -203,6 +213,17 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "Mais nítido, mas várias vezes mais pesado que o bicúbico em telas grandes.",
         "algo.hint.fsr": "Escala rápida com nitidez adaptativa.",
         "algo.hint.ai": "Qualidade máxima pelo modelo neural; exige uma GPU capaz.",
+        "field.internal_resolution": "Resolução interna",
+        "internal.auto": "Auto (recomendado)",
+        "internal.performance": "Desempenho (800 × 600)",
+        "internal.hd": "HD (1280 × 720)",
+        "internal.fullhd": "Full HD (1920 × 1080)",
+        "internal.native": "Nativa (tamanho da fonte)",
+        "internal.hint": ("Resolução em que os filtros trabalham, antes de a imagem ir para a tela. "
+                          "Em Auto o processamento acontece no tamanho da fonte, então um jogo em "
+                          "tela cheia não é reduzido e ampliado de novo; com o upscale neural ele "
+                          "usa metade da tela, porque o modelo dobra o quadro. Valores menores "
+                          "custam menos e ficam mais suaves."),
         "section.reshade": "RESHADE (D3D11)",
         "field.display_mode": "Como o overlay desenha",
         "display.gdi": "GDI (compatível, recomendado)",
@@ -344,6 +365,14 @@ _TRANSLATIONS = {
         "algo.hint.lanczos": "最锐利，但在大屏幕上比双三次慢数倍。",
         "algo.hint.fsr": "快速放大并带有自适应锐化。",
         "algo.hint.ai": "通过神经网络模型获得最佳质量，需要性能较强的 GPU。",
+        "field.internal_resolution": "内部处理分辨率",
+        "internal.auto": "自动（推荐）",
+        "internal.performance": "性能（800 × 600）",
+        "internal.hd": "HD（1280 × 720）",
+        "internal.fullhd": "全高清（1920 × 1080）",
+        "internal.native": "原生（源尺寸）",
+        "internal.hint": ("滤镜处理画面时使用的分辨率。自动模式下按源尺寸处理，全屏游戏不会被缩小后再放大；"
+                          "使用神经网络放大时取屏幕的一半，因为模型会把画面放大一倍。数值越低越省性能，画面越柔和。"),
         "section.reshade": "RESHADE（D3D11）",
         "field.display_mode": "叠加层绘制方式",
         "display.gdi": "GDI（兼容，推荐）",

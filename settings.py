@@ -12,6 +12,8 @@ CAPTURE_MODES = ("bitblt", "dxcam")
 SCALE_OPTIONS = ("1.0", "1.25", "1.5", "2.0", "Fullscreen")
 # Canonical preset names, kept here so the settings module never imports OpenCV.
 FILTER_PRESETS = ("Off", "Soft", "Sharp", "Vivid")
+# Resolution the pipeline works at: "Auto" decides by algorithm (see main.py).
+INTERNAL_RESOLUTIONS = ("Auto", "Performance", "HD", "Full HD", "Native")
 DISPLAY_MODES = ("GDI", "D3D11")
 
 ALGORITHM_OPTIONS = (
@@ -41,6 +43,7 @@ DEFAULT_SETTINGS = {
     "fg_enabled": True,
     # Post-processing filters applied by the overlay itself (see effects.py).
     "filter_preset": "Off",
+    "internal_resolution": "Auto",
     # How the overlay presents its image. "D3D11" gives the process a Direct3D
     # swapchain, which is what ReShade can hook; "GDI" is the compatible default.
     "display_mode": "GDI",
@@ -121,6 +124,7 @@ def normalize_settings(data):
         "algo": ALGORITHM_OPTIONS,
         "engine_type": ENGINE_OPTIONS,
         "filter_preset": FILTER_PRESETS,
+        "internal_resolution": INTERNAL_RESOLUTIONS,
         "display_mode": DISPLAY_MODES,
     }
     for key, options in choices.items():
