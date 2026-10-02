@@ -133,6 +133,20 @@ def affordable_timesteps(timesteps, budget_ms, inference_ms):
     return sorted(picked)
 
 
+def queue_capacity(queue):
+    """How many items a queue accepts.
+
+    ``queue.Queue`` exposes ``maxsize``, but ``multiprocessing.Queue`` keeps it in
+    ``_maxsize``: reading ``.maxsize`` from a process queue crashes with
+    ``AttributeError`` (it did, five seconds into every overlay session).
+    """
+    for attribute in ("maxsize", "_maxsize"):
+        value = getattr(queue, attribute, None)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
 def put_latest(target_queue, item):
     """Queue a frame for a real-time consumer, dropping the oldest when full.
 
@@ -588,6 +602,14 @@ class FrameGenerationApp:
         self.want_live_frames = self.live_fallback
         self.last_frame_generated = from_generator
         return frame
+
+    def _queue_report(self, display_size=None):
+        """One line about queue occupancy, for the periodic diagnostics log."""
+        if display_size is None:
+            display_size = self.display_queue.qsize()
+        return (f"filas captura {self.capture_queue.qsize()}/{queue_capacity(self.capture_queue)}"
+                f" · pós {self.process_queue.qsize()}/{queue_capacity(self.process_queue)}"
+                f" · exibição {display_size}/{queue_capacity(self.display_queue)}")
 
     def _measure_filter_chain(self):
         """Log what the chosen filter preset costs per frame.
@@ -1088,11 +1110,7 @@ class FrameGenerationApp:
                               f"{source}  ·  captura {self.frame_multiplier}x")
                         diagnostics.write_now("exibição", f"{self.current_fps:5.1f} FPS exibidos · "
                                                            f"{self.generated_fps:5.1f} gerados/s · "
-                                                           f"filas captura {self.capture_queue.qsize()}"
-                                                           f"/{self.capture_queue.maxsize} · pós "
-                                                           f"{self.process_queue.qsize()}"
-                                                           f"/{self.process_queue.maxsize} · exibição "
-                                                           f"{queue_size}/{self.display_queue.maxsize} · "
+                                                           f"{self._queue_report(queue_size)} · "
                                                            f"{source} · {self.dropped_generated} descartados")
 
                 # Precision pacing: sleep the bulk of the wait and spin only the

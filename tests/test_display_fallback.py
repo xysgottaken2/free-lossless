@@ -187,3 +187,68 @@ class LiveRenderBudgetTests(DisplayFallbackTests):
     def test_a_frame_already_at_display_size_is_passed_through(self):
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.assertIs(self.app._cheap_render(frame), frame)
+
+
+class QueueReportTests(unittest.TestCase):
+    """The periodic diagnostics line must not crash with real queues.
+
+    ``multiprocessing.Queue`` has no ``maxsize`` attribute — it keeps the bound in
+    ``_maxsize`` — and reading it crashed the overlay five seconds into a session.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import multiprocessing
+        cls.deps = stubs("cv2", "numpy", "pygame", "capture", "engine", "ui", "selector",
+                         "filters", "win32gui", "win32api", "win32con", "tkinter")
+        cls.module = load_module("main", cls.deps, runtime=True)
+        cls.multiprocessing = multiprocessing
+
+    def queue_capacity(self, size):
+        process_queue = self.multiprocessing.Queue(maxsize=size)
+        self.addCleanup(process_queue.close)
+        return self.module.queue_capacity(process_queue)
+
+    def test_a_process_queue_reports_its_capacity(self):
+        self.assertEqual(self.queue_capacity(2), 2)
+        self.assertEqual(self.queue_capacity(7), 7)
+
+    def test_a_thread_queue_reports_its_capacity(self):
+        from queue import Queue
+        self.assertEqual(self.module.queue_capacity(Queue(maxsize=3)), 3)
+
+    def test_an_unknown_object_reports_zero_instead_of_raising(self):
+        self.assertEqual(self.module.queue_capacity(object()), 0)
+        self.assertEqual(self.module.queue_capacity(None), 0)
+
+    def test_the_report_line_works_with_the_queues_the_app_really_uses(self):
+        from queue import Queue
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.capture_queue = self.multiprocessing.Queue(maxsize=2)
+        app.process_queue = self.multiprocessing.Queue(maxsize=3)
+        app.display_queue = Queue(maxsize=5)
+        self.addCleanup(app.capture_queue.close)
+        self.addCleanup(app.process_queue.close)
+        line = app._queue_report()
+        self.assertIn("captura 0/2", line)
+        self.assertIn("pós 0/3", line)
+        self.assertIn("exibição 0/5", line)
+
+    def test_the_report_line_counts_what_is_waiting(self):
+        from queue import Queue
+        app = self.module.FrameGenerationApp.__new__(self.module.FrameGenerationApp)
+        app.capture_queue = self.multiprocessing.Queue(maxsize=2)
+        app.process_queue = self.multiprocessing.Queue(maxsize=3)
+        app.display_queue = Queue(maxsize=5)
+        self.addCleanup(app.capture_queue.close)
+        self.addCleanup(app.process_queue.close)
+        app.display_queue.put("frame")
+        app.display_queue.put("frame")
+        self.assertIn("exibição 2/5", app._queue_report())
+
+    def test_the_loop_uses_the_report_helper(self):
+        """No direct ``.maxsize`` on a process queue may sneak back into the loop."""
+        import inspect
+        source = inspect.getsource(self.module.FrameGenerationApp.run)
+        self.assertNotIn(".maxsize", source)
+        self.assertIn("_queue_report", source)
